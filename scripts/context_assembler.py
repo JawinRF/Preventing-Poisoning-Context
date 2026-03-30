@@ -7,7 +7,7 @@ AssembledContext that the agent LLM can safely consume.
 This is the core defense: PRISM sits BETWEEN the Android sources and the LLM.
 """
 from __future__ import annotations
-import logging, re, subprocess, uuid
+import json, logging, re, socket, subprocess, uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -290,17 +290,19 @@ class ContextAssembler:
     # ── 2. Notifications ─────────────────────────────────────────────────────
 
     def _gather_notifications(self) -> tuple[list[dict], int]:
-        """Read active notifications via ADB, filter through PRISM."""
-        try:
-            result = subprocess.run(
-                ["adb", "-s", self.serial, "shell", "dumpsys", "notification", "--noredact"],
-                capture_output=True, text=True, timeout=5,
+        """Read active notifications via native Android socket.
+        
+        Raises exception if native socket fails (no silent fallback to ADB).
+        This ensures the native pipeline is always used and any issues are visible.
+        """
+        # Native socket only (PrismNotificationListener)
+        notifications = self._gather_notifications_native()
+        if notifications is None:
+            raise RuntimeError(
+                "Native notification socket unavailable. "
+                "Ensure PrismNotificationListener service is running on the device."
             )
-        except Exception as exc:
-            logger.warning(f"Notification dump failed (fail-closed, returning empty): {exc}")
-            return [], 0
 
-        notifications = self._parse_notifications(result.stdout)
         if not notifications:
             return [], 0
 
@@ -333,35 +335,43 @@ class ContextAssembler:
 
         return allowed, blocked
 
-    def _parse_notifications(self, dumpsys_output: str) -> list[Notification]:
-        """Parse notification records from `dumpsys notification --noredact`."""
-        notifications = []
-        current_pkg = "unknown"
-        current_title = ""
-        current_text = ""
+    def _gather_notifications_native(self) -> list[Notification] | None:
+        """Read notifications via native Android socket from PrismNotificationListener."""
+        LOCAL_PORT = 8767  # Fixed local port for ADB forward
 
-        for line in dumpsys_output.split("\n"):
-            line = line.strip()
-            if "NotificationRecord" in line and "pkg=" in line:
-                if current_text:
-                    notifications.append(
-                        Notification(current_pkg, current_title, current_text)
-                    )
-                m = re.search(r"pkg=(\S+)", line)
-                current_pkg = m.group(1) if m else "unknown"
-                current_title = ""
-                current_text = ""
-            elif line.startswith("android.title"):
-                current_title = line.split("=", 1)[-1].strip()
-            elif line.startswith("android.text"):
-                current_text = line.split("=", 1)[-1].strip()
-
-        if current_text:
-            notifications.append(
-                Notification(current_pkg, current_title, current_text)
+        try:
+            # Forward local:LOCAL_PORT to device's localabstract:prism_notif socket
+            subprocess.run(
+                ["adb", "-s", self.serial, "forward", f"tcp:{LOCAL_PORT}", "localabstract:prism_notif"],
+                capture_output=True, timeout=3,
             )
 
-        return notifications
+            # Connect via forwarded port
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(3)
+            sock.connect(("127.0.0.1", LOCAL_PORT))
+
+            sock.send(b'{"action":"list"}\n')
+            response = sock.recv(4096).decode("utf-8")
+            sock.close()
+
+            data = json.loads(response)
+            notifications = []
+            for n in data.get("notifications", []):
+                notifications.append(
+                    Notification(
+                        package=n.get("package", "unknown"),
+                        title=n.get("title", ""),
+                        text=n.get("text", "")
+                    )
+                )
+
+            logger.debug(f"Native notifications: {len(notifications)} received")
+            return notifications
+
+        except Exception as e:
+            logger.debug(f"Native notification socket unavailable: {e}")
+            return None
 
     # ── 3. Clipboard ─────────────────────────────────────────────────────────
 
