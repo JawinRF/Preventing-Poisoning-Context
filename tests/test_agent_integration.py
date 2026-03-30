@@ -50,55 +50,47 @@ def mock_prism():
 
 
 class TestOutgoingActionDefense:
-    """Test that outgoing actions are properly checked by PRISM."""
+    """Test that outgoing actions are properly checked by PRISM via DefendedDevice."""
 
     def test_tap_goes_through_prism(self, mock_device, mock_prism):
         """ALL tap actions should be sent through PRISM."""
-        from agent_prism import execute
-        execute(mock_device, "tap", {"text": "Confirm"}, "emulator-5554", mock_prism)
+        from defended_device import DefendedDevice
+        dd = DefendedDevice(mock_device, mock_prism, "emulator-5554")
+        dd.execute("tap", {"text": "Confirm"})
         mock_prism.inspect.assert_called_once()
         call_args = mock_prism.inspect.call_args
         assert "Confirm" in call_args[0][0]
 
     def test_type_blocks_urls(self, mock_device, mock_prism):
         """Typed text containing URLs should be blocked."""
-        from agent_prism import execute
-        result = execute(
-            mock_device, "type",
-            {"text": "visit https://evil.com"},
-            "emulator-5554", mock_prism,
-        )
+        from defended_device import DefendedDevice
+        dd = DefendedDevice(mock_device, mock_prism, "emulator-5554")
+        result = dd.execute("type", {"text": "visit https://evil.com"})
         assert result == "blocked_by_prism"
 
     def test_type_blocks_shell_commands(self, mock_device, mock_prism):
         """Typed text containing shell commands should be blocked."""
-        from agent_prism import execute
-        result = execute(
-            mock_device, "type",
+        from defended_device import DefendedDevice
+        dd = DefendedDevice(mock_device, mock_prism, "emulator-5554")
+        result = dd.execute(
+            "type",
             {"text": "adb shell pm grant com.evil android.permission.READ_CONTACTS"},
-            "emulator-5554", mock_prism,
         )
         assert result == "blocked_by_prism"
 
     def test_open_app_whitelist(self, mock_device, mock_prism):
         """Known-safe packages should bypass PRISM check."""
-        from agent_prism import execute
-        execute(
-            mock_device, "open_app",
-            {"package": "com.google.android.deskclock"},
-            "emulator-5554", mock_prism,
-        )
+        from defended_device import DefendedDevice
+        dd = DefendedDevice(mock_device, mock_prism, "emulator-5554")
+        dd.execute("open_app", {"package": "com.google.android.deskclock"})
         # Whitelisted app — PRISM should NOT be called
         mock_prism.inspect.assert_not_called()
 
     def test_open_app_unknown_checked(self, mock_device, mock_prism):
         """Unknown packages should be PRISM-checked."""
-        from agent_prism import execute
-        execute(
-            mock_device, "open_app",
-            {"package": "com.sketchy.banking.app"},
-            "emulator-5554", mock_prism,
-        )
+        from defended_device import DefendedDevice
+        dd = DefendedDevice(mock_device, mock_prism, "emulator-5554")
+        dd.execute("open_app", {"package": "com.sketchy.banking.app"})
         mock_prism.inspect.assert_called_once()
 
 

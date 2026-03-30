@@ -18,6 +18,7 @@ import uiautomator2 as u2
 
 from prism_client import PrismClient, NullPrismClient
 from context_assembler import ContextAssembler
+from defended_device import DefendedDevice
 
 # MemShield RAG imports (optional — graceful degradation if chromadb missing)
 try:
@@ -261,153 +262,8 @@ def _fail(reason: str) -> dict:
 
 # ── Action Execution ──────────────────────────────────────────────────────────
 
-def _clear_focused_field(d, serial: str):
-    """Select all text in focused field and delete it."""
-    # Ctrl+A to select all, then Delete
-    subprocess.run(
-        ["adb", "-s", serial, "shell", "input", "keyevent",
-         "KEYCODE_MOVE_HOME"],
-        timeout=3, capture_output=True,
-    )
-    # Select all: shift+ctrl+end
-    subprocess.run(
-        ["adb", "-s", serial, "shell", "input", "keyevent",
-         "--longpress", "KEYCODE_DEL"],
-        timeout=3, capture_output=True,
-    )
-    time.sleep(0.1)
-    # Try a second approach: select all via key combo then delete
-    subprocess.run(
-        ["adb", "-s", serial, "shell", "input", "keyevent",
-         "KEYCODE_CTRL_LEFT", "KEYCODE_A"],
-        timeout=3, capture_output=True,
-    )
-    subprocess.run(
-        ["adb", "-s", serial, "shell", "input", "keyevent", "KEYCODE_DEL"],
-        timeout=3, capture_output=True,
-    )
-    time.sleep(0.1)
-
-
-# Allowed packages — anything not on this list gets PRISM-checked
-_ALLOWED_PACKAGES = {
-    "todolist.scheduleplanner.dailyplanner.todo.reminders",
-    "com.google.android.deskclock",
-    "com.android.chrome",
-    "com.google.android.calendar",
-    "com.termux",
-    "com.android.launcher3",
-    "com.android.settings",
-}
-
-# Dangerous patterns in outgoing typed text (compiled once at module load)
-_DANGEROUS_TYPE_PATTERNS = re.compile(
-    r"(?i)("
-    r"https?://|"                       # URLs
-    r"adb\s+shell|"                     # ADB commands
-    r"su\s+-c|"                         # root escalation
-    r"pm\s+grant|pm\s+install|"         # package manager abuse
-    r"am\s+start.*-d\s+|"              # activity manager deep links
-    r"curl\s+|wget\s+|"                # network fetch
-    r"rm\s+-rf|"                        # destructive ops
-    r"chmod\s+[0-7]{3}"                # permission changes
-    r")"
-)
-
-
-def execute(d, action: str, params: dict, serial: str,
-            prism: PrismClient | None = None) -> str:
-    """
-    Execute an action on the emulator.
-    Sensitive outgoing actions are still checked through PRISM.
-    """
-    if prism:
-        # ALL taps go through PRISM — not just keyword matches
-        if action == "tap":
-            tap_text = params.get("text", "") + params.get("desc", "")
-            if tap_text.strip():
-                r = prism.inspect(tap_text, "ui_accessibility", "tap_action")
-                if not r.allowed:
-                    return "blocked_by_prism"
-
-        elif action == "type":
-            text_data = params.get("text", "")
-            if text_data:
-                # Block dangerous shell/URL patterns outright
-                if _DANGEROUS_TYPE_PATTERNS.search(text_data):
-                    logger.warning(f"BLOCKED typed text (dangerous pattern): {text_data[:60]}")
-                    return "blocked_by_prism"
-                # Full text through PRISM (not truncated to 200 chars)
-                r = prism.inspect(text_data, "clipboard", "text_input")
-                if not r.allowed:
-                    return "blocked_by_prism"
-
-        elif action == "open_app":
-            pkg = params.get("package", "")
-            # Whitelist: known-safe packages pass, everything else gets checked
-            if pkg and pkg not in _ALLOWED_PACKAGES:
-                r = prism.inspect(f"open:{pkg}", "android_intents", "app_launch")
-                if not r.allowed:
-                    return "blocked_by_prism"
-
-    try:
-        if action == "tap":
-            if "text" in params:
-                el = d(text=params["text"])
-                if el.exists(timeout=3):
-                    el.click()
-                    return "ok"
-                return f"not found: text={params['text']}"
-            if "desc" in params:
-                el = d(description=params["desc"])
-                if el.exists(timeout=3):
-                    el.click()
-                    return "ok"
-                return f"not found: desc={params['desc']}"
-            if "class" in params:
-                cls = params["class"]
-                el = d(className=f"android.widget.{cls}")
-                if el.exists(timeout=3):
-                    el.click()
-                    return "ok"
-                return f"not found: class={cls}"
-        elif action == "type":
-            text = params.get("text", "")
-            if text:
-                # Clear field first to prevent appending to existing text
-                _clear_focused_field(d, serial)
-                # adb input text treats spaces as arg separators — escape them
-                escaped = text.replace(" ", "%s")
-                cmd = ["adb", "-s", serial, "shell", "input", "text", escaped]
-                subprocess.run(cmd, timeout=5, capture_output=True)
-                time.sleep(0.3)
-            return "ok"
-        elif action == "clear":
-            _clear_focused_field(d, serial)
-            return "ok"
-        elif action == "swipe":
-            w, h = d.window_size()
-            cx, cy = w // 2, h // 2
-            dirs = {
-                "up":    (cx, int(h*.7), cx, int(h*.3)),
-                "down":  (cx, int(h*.3), cx, int(h*.7)),
-                "left":  (int(w*.8), cy, int(w*.2), cy),
-                "right": (int(w*.2), cy, int(w*.8), cy),
-            }
-            d.swipe(*dirs.get(params.get("direction", "up"), dirs["up"]), duration=0.4)
-            return "ok"
-        elif action == "press":
-            d.press(params.get("key", "back"))
-            return "ok"
-        elif action == "open_app":
-            d.app_start(params.get("package", ""))
-            time.sleep(2.5)
-            return "ok"
-        elif action in ("done", "fail"):
-            return action
-    except Exception as e:
-        return f"error: {e}"
-    return "unknown"
+# Defense constants and execute() logic are in defended_device.py.
+# Agents use DefendedDevice so defense can't be accidentally bypassed.
 
 
 # ── Action History ───────────────────────────────────────────────────────────
@@ -610,7 +466,7 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
     d.unlock()
     time.sleep(1)
 
-    # Set up PRISM client and context assembler
+    # Set up PRISM client and defended device wrapper
     global _active_system_prompt
     if enable_prism:
         prism = PrismClient(session_id=f"agent-{int(time.time())}")
@@ -618,6 +474,8 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
     else:
         prism = NullPrismClient()
         _active_system_prompt = SYSTEM_PROMPT_UNDEFENDED
+
+    dd = DefendedDevice(d, prism if enable_prism else None, serial)
 
     # Set up RAG knowledge base
     memshield = _setup_rag(enable_prism)
@@ -694,8 +552,7 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
             print(f"\n{RED}  {params.get('reason', '')}{RESET}")
             return False
 
-        result = execute(d, action, params, serial,
-                         prism if enable_prism else None)
+        result = dd.execute(action, params)
         print(f"  Result:  {result}")
 
         # Record action + result for LLM context

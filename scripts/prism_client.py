@@ -3,7 +3,7 @@ prism_client.py — Thin HTTP client for the PRISM Shield sidecar.
 Single point of contact for all PRISM Shield interactions.
 """
 from __future__ import annotations
-import hashlib, logging, os, uuid
+import hashlib, logging, os, time, uuid
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -21,6 +21,7 @@ class InspectResult:
     reason: str
     layer: str            # Layer1-Heuristics | Layer2-LocalLLM | Layer3-DeBERTa | ...
     placeholder: str | None = None
+    ticket_id: str | None = None
 
     @property
     def allowed(self) -> bool:
@@ -83,6 +84,7 @@ class PrismClient:
                 reason=data.get("reason", "unknown"),
                 layer=data.get("layer_triggered", "unknown"),
                 placeholder=data.get("placeholder"),
+                ticket_id=data.get("ticket_id"),
             )
         except Exception as e:
             logger.warning(f"PRISM sidecar error: {e}")
@@ -131,6 +133,40 @@ class PrismClient:
             else:
                 blocked.append(item)
         return allowed, blocked
+
+    def poll_quarantine(self, ticket_id: str, timeout_s: float = 5.0,
+                        poll_interval_s: float = 0.5) -> InspectResult:
+        """
+        Poll the sidecar for a quarantine ticket's resolution.
+        The VLM runs asynchronously — this waits briefly for its verdict.
+        Returns BLOCK if the ticket isn't resolved within timeout.
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                resp = requests.get(
+                    f"{self.url}/v1/ticket/{ticket_id}",
+                    timeout=2,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    status = data.get("status", "PENDING")
+                    if status != "PENDING":
+                        return InspectResult(
+                            verdict=status,
+                            confidence=data.get("confidence", 0.0),
+                            reason=data.get("reason", "quarantine_resolved"),
+                            layer=data.get("layer_triggered", "VLM"),
+                        )
+            except Exception:
+                pass
+            time.sleep(poll_interval_s)
+
+        logger.warning(f"Quarantine ticket {ticket_id} not resolved within {timeout_s}s — blocking")
+        return InspectResult(
+            verdict="BLOCK", confidence=1.0,
+            reason="quarantine_timeout", layer="VLM",
+        )
 
     def health(self) -> bool:
         """Check if the sidecar is alive."""

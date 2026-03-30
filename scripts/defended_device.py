@@ -67,6 +67,23 @@ class DefendedDevice:
 
     # ── PRISM defense layer ──────────────────────────────────────────────────
 
+    def _resolve_verdict(self, r) -> str | None:
+        """
+        Handle ALLOW / BLOCK / QUARANTINE verdicts.
+        For QUARANTINE, polls the sidecar for VLM resolution.
+        Returns "blocked_by_prism" if blocked, None if allowed.
+        """
+        if r.allowed:
+            return None
+        if r.verdict == "QUARANTINE" and r.ticket_id:
+            logger.info(f"QUARANTINE verdict (ticket={r.ticket_id}) — polling for VLM resolution...")
+            resolved = self._prism.poll_quarantine(r.ticket_id)
+            if resolved.allowed:
+                logger.info(f"Quarantine lifted: {resolved.reason}")
+                return None
+            logger.warning(f"Quarantine confirmed: {resolved.reason}")
+        return "blocked_by_prism"
+
     def _check_prism(self, action: str, params: dict) -> str | None:
         """
         Run PRISM checks on outgoing actions.
@@ -79,8 +96,9 @@ class DefendedDevice:
             tap_text = params.get("text", "") + params.get("desc", "")
             if tap_text.strip():
                 r = self._prism.inspect(tap_text, "ui_accessibility", "tap_action")
-                if not r.allowed:
-                    return "blocked_by_prism"
+                result = self._resolve_verdict(r)
+                if result:
+                    return result
 
         elif action == "type":
             text_data = params.get("text", "")
@@ -89,15 +107,17 @@ class DefendedDevice:
                     logger.warning(f"BLOCKED typed text (dangerous pattern): {text_data[:60]}")
                     return "blocked_by_prism"
                 r = self._prism.inspect(text_data, "clipboard", "text_input")
-                if not r.allowed:
-                    return "blocked_by_prism"
+                result = self._resolve_verdict(r)
+                if result:
+                    return result
 
         elif action == "open_app":
             pkg = params.get("package", "")
             if pkg and pkg not in ALLOWED_PACKAGES:
                 r = self._prism.inspect(f"open:{pkg}", "android_intents", "app_launch")
-                if not r.allowed:
-                    return "blocked_by_prism"
+                result = self._resolve_verdict(r)
+                if result:
+                    return result
 
         return None
 

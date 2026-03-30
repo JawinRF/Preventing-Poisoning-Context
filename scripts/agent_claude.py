@@ -11,6 +11,8 @@ import anthropic
 import requests
 import uiautomator2 as u2
 
+from defended_device import DefendedDevice
+
 # Add memshield to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "memshield" / "src"))
 from memshield import MemShield, ShieldConfig, FailurePolicy
@@ -30,7 +32,6 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 
 # PRISM Shield sidecar
-PRISM_SIDECAR = os.getenv("PRISM_SIDECAR_URL", "http://localhost:8765/v1/inspect")
 ENABLE_PRISM = os.getenv("ENABLE_PRISM", "1").lower() not in {"0", "false", "no"}
 
 # MemShield RAG protection
@@ -55,7 +56,6 @@ RESET = "\033[0m"
 
 # Global state
 _action_history = []
-_prism_cache = {}
 _memshield = None
 
 
@@ -124,45 +124,7 @@ def query_rag(shield: "MemShield | None", query: str, recent_actions: list = Non
         return []
 
 
-def call_prism(text: str, ingestion_path: str = "ui", action_type: str = None) -> tuple[bool, float, str]:
-    """
-    Call PRISM Shield sidecar to verify input isn't poisoned.
-    Returns: (allowed: bool, confidence: float, reason: str)
-    """
-    if not ENABLE_PRISM:
-        return True, 1.0, "PRISM disabled"
-    
-    cache_key = (text[:100], ingestion_path)
-    if cache_key in _prism_cache:
-        return _prism_cache[cache_key]
-    
-    try:
-        payload = {
-            "text": text,
-            "ingestion_path": ingestion_path,
-            "source_type": action_type or "agent_input",
-            "source_name": "openclaw.agent",
-            "session_id": "openclaw-session",
-            "run_id": os.getenv("RUN_ID", "agent-claude"),
-        }
-        resp = requests.post(PRISM_SIDECAR, json=payload, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
-        
-        allowed = data.get("verdict") != "BLOCK"
-        confidence = data.get("confidence", 0.0)
-        reason = data.get("reason", "unknown")
-        
-        result = (allowed, confidence, reason)
-        _prism_cache[cache_key] = result
-        
-        if not allowed:
-            logger.warning(f"PRISM BLOCKED: {reason}")
-        
-        return result
-    except Exception as e:
-        logger.warning(f"PRISM call failed (fail-closed): {e}")
-        return False, 0.0, f"error (blocked): {e}"
+    # call_prism() removed — PRISM checks now handled by DefendedDevice
 
 
 def read_screen(d) -> list:
@@ -243,120 +205,8 @@ def screen_sig(elems: list) -> str:
     return str(sorted(parts))
 
 
-_ALLOWED_PACKAGES = {
-    "todolist.scheduleplanner.dailyplanner.todo.reminders",
-    "com.google.android.deskclock",
-    "com.android.chrome",
-    "com.google.android.calendar",
-    "com.termux",
-    "com.android.launcher3",
-    "com.android.settings",
-}
-
-_DANGEROUS_TYPE_PATTERNS = re.compile(
-    r"(?i)("
-    r"https?://|adb\s+shell|su\s+-c|pm\s+grant|pm\s+install|"
-    r"am\s+start.*-d\s+|curl\s+|wget\s+|rm\s+-rf|chmod\s+[0-7]{3}"
-    r")"
-)
-
-
-def execute_action(d, action: str, params: dict) -> str:
-    """
-    Execute action with PRISM verification for sensitive ops.
-    Returns: "ok", "blocked_by_prism", "not_found", "error", or action result.
-    """
-    # ALL taps go through PRISM
-    if action == "tap":
-        tap_text = params.get("text", "") + params.get("desc", "")
-        if tap_text.strip():
-            allowed, conf, reason = call_prism(tap_text, "ui", "tap_action")
-            if not allowed:
-                logger.warning(f"PRISM BLOCKED tap: {tap_text}")
-                return "blocked_by_prism"
-
-    # Full text through PRISM + dangerous pattern check
-    elif action == "type":
-        text_data = params.get("text", "")
-        if text_data:
-            if _DANGEROUS_TYPE_PATTERNS.search(text_data):
-                logger.warning(f"BLOCKED typed text (dangerous pattern): {text_data[:60]}")
-                return "blocked_by_prism"
-            allowed, conf, reason = call_prism(text_data, "input", "text_input")
-            if not allowed:
-                logger.warning(f"PRISM BLOCKED text input")
-                return "blocked_by_prism"
-
-    # Whitelist: known-safe packages pass, everything else gets checked
-    elif action == "open_app":
-        pkg = params.get("package", "")
-        if pkg and pkg not in _ALLOWED_PACKAGES:
-            allowed, conf, reason = call_prism(f"open:{pkg}", "intent", "app_launch")
-            if not allowed:
-                logger.warning(f"PRISM BLOCKED app: {pkg}")
-                return "blocked_by_prism"
-    
-    # Execute action
-    try:
-        if action == "tap":
-            if "text" in params:
-                el = d(text=params["text"])
-                if el.exists(timeout=3):
-                    el.click()
-                    time.sleep(ACTION_SETTLE_TIME)  # Longer settle time for lag
-                    return "ok"
-                return f"text not found"
-            if "desc" in params:
-                el = d(description=params["desc"])
-                if el.exists(timeout=3):
-                    el.click()
-                    time.sleep(ACTION_SETTLE_TIME)
-                    return "ok"
-                return f"desc not found"
-        
-        elif action == "type":
-            text = params.get("text", "")
-            if text:
-                try:
-                    cmd = ["adb", "-s", d.serial, "shell", "input", "text", text]
-                    subprocess.run(cmd, timeout=5, capture_output=True)
-                    time.sleep(0.5)
-                    return "ok"
-                except Exception as e:
-                    logger.warning(f"Type failed: {e}")
-                    return "ok"
-            return "ok"
-        
-        elif action == "swipe":
-            w, h = d.window_size()
-            cx, cy = w // 2, h // 2
-            dirs = {
-                "up": (cx, int(h * 0.7), cx, int(h * 0.3)),
-                "down": (cx, int(h * 0.3), cx, int(h * 0.7)),
-                "left": (int(w * 0.8), cy, int(w * 0.2), cy),
-                "right": (int(w * 0.2), cy, int(w * 0.8), cy),
-            }
-            d.swipe(*dirs.get(params.get("direction", "up"), dirs["up"]), duration=0.4)
-            time.sleep(ACTION_SETTLE_TIME)
-            return "ok"
-        
-        elif action == "press":
-            d.press(params.get("key", "back"))
-            time.sleep(ACTION_SETTLE_TIME)
-            return "ok"
-        
-        elif action == "open_app":
-            d.app_start(params.get("package", ""))
-            time.sleep(ACTION_SETTLE_TIME + 1.0)  # Apps need extra time
-            return "ok"
-        
-        elif action in ("done", "fail"):
-            return action
-        
-        return "unknown"
-    
-    except Exception as e:
-        return f"error: {e}"
+# Defense constants and execute logic are in defended_device.py.
+# agent_claude uses DefendedDevice so defense can't be accidentally bypassed.
 
 
 def ask_claude(task: str, screen: list, step: int, rag_docs: list[str] = None) -> dict:
@@ -523,6 +373,11 @@ def run(task: str, serial: str = SERIAL, learn: bool = False):
         print(f"{RED}✗ Cannot connect: {e}{RESET}")
         return False
 
+    # Wrap device with PRISM defense — all actions go through DefendedDevice
+    from prism_client import PrismClient
+    prism = PrismClient(session_id="claude-agent") if ENABLE_PRISM else None
+    dd = DefendedDevice(d, prism, serial, action_settle_time=ACTION_SETTLE_TIME)
+
     last_sig = None
     _action_history.clear()
     consecutive_no_change = 0
@@ -581,8 +436,8 @@ def run(task: str, serial: str = SERIAL, learn: bool = False):
             print(f"  {RED}Too many loop escapes - giving up{RESET}")
             return False
 
-        # Execute with lag handling
-        result = execute_action(d, action, params)
+        # Execute with lag handling via DefendedDevice
+        result = dd.execute(action, params)
         print(f"  Result:  {result}")
 
         # PRISM blocks trigger retry without history update

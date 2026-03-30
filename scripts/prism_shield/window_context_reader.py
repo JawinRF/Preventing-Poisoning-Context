@@ -2,9 +2,14 @@
 window_context_reader.py
 ------------------------
 Reads the current ScreenContext from the Android WindowManager bridge service.
-The Android service writes a JSON-serialized ScreenContext to a Unix domain
-socket at SOCKET_PATH once per accessibility event (i.e. every time the
-visible UI changes).
+The Android service writes JSON-serialized ScreenContext objects to a TCP socket.
+
+Architecture: The Android-side service listens on a TCP port on the device.
+The host connects via ADB port forwarding:
+    adb forward tcp:PRISM_WCR_PORT tcp:PRISM_WCR_PORT
+
+Set PRISM_WCR_HOST / PRISM_WCR_PORT env vars to override defaults.
+Defaults: 127.0.0.1:18765 (localhost via ADB forward).
 
 The Python pipeline reads the LATEST cached context synchronously.
 This is a non-blocking read — if no context is available, NULL_CONTEXT is returned.
@@ -13,24 +18,29 @@ In unit tests and CI (no Android service running), always returns NULL_CONTEXT.
 """
 
 import json
+import os
 import socket
 import threading
 from .screen_context import ScreenContext, NULL_CONTEXT
 from .screen_type_classifier import enrich
 
-SOCKET_PATH     = "/data/local/tmp/prism_window_ctx.sock"
+# TCP connection to Android service via ADB port forwarding
+WCR_HOST = os.getenv("PRISM_WCR_HOST", "127.0.0.1")
+WCR_PORT = int(os.getenv("PRISM_WCR_PORT", "18765"))
 READ_TIMEOUT_MS = 2.0   # Hard cap: must not stall the <2ms pipeline
 
 
 class WindowContextReader:
     """
-    Maintains a background thread that listens on the Unix socket and
-    caches the most recent ScreenContext. The pipeline calls get_context()
-    which returns the cached value instantly — zero blocking in the hot path.
+    Maintains a background thread that listens on a TCP socket (forwarded
+    from Android via `adb forward`) and caches the most recent ScreenContext.
+    The pipeline calls get_context() which returns the cached value instantly
+    — zero blocking in the hot path.
     """
 
-    def __init__(self, socket_path: str = SOCKET_PATH):
-        self._socket_path = socket_path
+    def __init__(self, host: str = WCR_HOST, port: int = WCR_PORT):
+        self._host = host
+        self._port = port
         self._lock         = threading.Lock()
         self._latest       = NULL_CONTEXT
         self._running      = False
@@ -56,15 +66,16 @@ class WindowContextReader:
 
     def _listen_loop(self):
         """
-        Background thread: connects to the Android service socket and
-        reads new ScreenContext JSON objects as they arrive.
+        Background thread: connects to the Android service via TCP
+        (forwarded through `adb forward tcp:PORT tcp:PORT`) and reads
+        new ScreenContext JSON objects as they arrive.
         Each message is a newline-terminated JSON object.
         """
         while self._running:
             try:
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(READ_TIMEOUT_MS / 1000.0)
-                sock.connect(self._socket_path)
+                sock.connect((self._host, self._port))
                 buf = ""
                 while self._running:
                     try:
@@ -80,8 +91,8 @@ class WindowContextReader:
                     except socket.timeout:
                         continue
                 sock.close()
-            except (ConnectionRefusedError, FileNotFoundError):
-                # Android service not running (CI, unit test, or service crashed)
+            except (ConnectionRefusedError, OSError):
+                # Android service not running (CI, unit test, or ADB forward not set up)
                 # Stay in loop, retry every second
                 import time
                 time.sleep(1.0)
