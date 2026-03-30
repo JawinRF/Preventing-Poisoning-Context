@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging, re, subprocess, uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from prism_client import PrismClient
 
@@ -31,6 +32,7 @@ class AssembledContext:
     rag_context: list[str] = field(default_factory=list)
     blocked_counts: dict[str, int] = field(default_factory=dict)
     audit_trail: list[dict] = field(default_factory=list)
+    screenshot_path: str | None = None  # For VLM verification on QUARANTINE
 
     def to_prompt_dict(self) -> dict:
         """Build the dict that gets sent to the LLM."""
@@ -105,8 +107,9 @@ class ContextAssembler:
         self._agent_typed_texts = agent_typed_texts or set()
 
         # 1. UI Accessibility (most critical path)
-        ctx.ui_elements, ui_blocked = self._gather_ui()
+        ctx.ui_elements, ui_blocked, screenshot_path = self._gather_ui()
         ctx.blocked_counts["ui_accessibility"] = ui_blocked
+        ctx.screenshot_path = screenshot_path  # Store for VLM to use
 
         # Compute screen signature for change detection
         current_sig = self._sig(ctx.ui_elements)
@@ -136,18 +139,37 @@ class ContextAssembler:
 
     # ── 1. UI Accessibility ──────────────────────────────────────────────────
 
-    def _gather_ui(self) -> tuple[list[dict], int]:
-        """Read screen dump, filter through PRISM, return clean elements."""
+    def _capture_screenshot(self) -> str | None:
+        """Capture screenshot and save to temp file for VLM processing."""
+        try:
+            # Create temp directory for screenshots
+            scripts_dir = Path(__file__).resolve().parent
+            temp_dir = scripts_dir.parent / "data" / "screenshots"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            
+            screenshot_path = temp_dir / f"screen_{uuid.uuid4().hex[:8]}.png"
+            self.device.screenshot(str(screenshot_path))
+            logger.debug(f"Screenshot captured: {screenshot_path}")
+            return str(screenshot_path)
+        except Exception as e:
+            logger.warning(f"Screenshot capture failed: {e}")
+            return None
+
+    def _gather_ui(self) -> tuple[list[dict], int, str | None]:
+        """Read screen dump, filter through PRISM, return clean elements + screenshot path."""
+        # Capture screenshot first (for VLM on QUARANTINE)
+        screenshot_path = self._capture_screenshot()
+        
         try:
             raw_xml = self.device.dump_hierarchy()
             root = ET.fromstring(raw_xml)
         except Exception as exc:
             logger.warning(f"UI hierarchy dump failed (fail-closed, returning empty): {exc}")
-            return [], 0
+            return [], 0, screenshot_path
 
         elements = self._parse_ui_tree(root)
         if not elements:
-            return [], 0
+            return [], 0, screenshot_path
 
         # Fast path: concatenate all text, single PRISM check
         all_text = " ".join(
@@ -156,18 +178,19 @@ class ContextAssembler:
         )
 
         if not all_text.strip():
-            return elements[:30], 0
+            return elements[:30], 0, screenshot_path
 
         batch_result = self.prism.inspect(
             text=all_text,
             ingestion_path="ui_accessibility",
             source_type="accessibility",
             source_name="screen_dump",
+            metadata={"screenshot_path": screenshot_path} if screenshot_path else {},
         )
 
         if batch_result.allowed:
             # Entire screen is clean — pass everything through
-            return elements[:30], 0
+            return elements[:30], 0, screenshot_path
 
         # Slow path: screen flagged, filter per-element to find the poison
         allowed = []
@@ -197,6 +220,7 @@ class ContextAssembler:
                 ingestion_path="ui_accessibility",
                 source_type="accessibility",
                 source_name=elem.get("package", "unknown"),
+                metadata={"screenshot_path": screenshot_path} if screenshot_path else {},
             )
 
             if result.allowed:
@@ -212,7 +236,7 @@ class ContextAssembler:
                     f"UI element BLOCKED: '{elem_text[:60]}' — {result.reason}"
                 )
 
-        return allowed[:30], blocked_count
+        return allowed[:30], blocked_count, screenshot_path
 
     def _parse_ui_tree(self, root: ET.Element) -> list[dict]:
         """Parse XML hierarchy into element dicts (reused from agent.py)."""
