@@ -1,4 +1,4 @@
-## PRISM Shield & MemShield — Preventing Poisoned Context for Mobile Agents
+## Preventing Poisoned Context for Mobile Agents
 
 This repo implements a complete defense system against context poisoning attacks on LLM-driven mobile agents, covering all 7 Android ingestion paths.
 
