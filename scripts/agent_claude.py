@@ -3,7 +3,7 @@
 agent_claude.py — Android agent with Claude + PRISM Shield + MemShield integration
 Robust to emulator lag, handles poisoned context detection.
 """
-import argparse, hashlib, json, logging, os, time, subprocess, sys
+import argparse, hashlib, json, logging, os, re, time, subprocess, sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -80,25 +80,17 @@ def _setup_rag() -> "MemShield | None":
         client = chromadb.PersistentClient(path=db_path)
         collection = client.get_or_create_collection("agent_kb")
 
-        try:
-            shield = MemShield(
-                collection=collection,
-                config=ShieldConfig(
-                    enable_normalization=True,
-                    enable_ml_layers=True,
-                    enable_provenance=True,
-                ),
-            )
-        except ImportError:
-            logger.warning("ML layers unavailable — RAG using regex + provenance only")
-            shield = MemShield(
-                collection=collection,
-                config=ShieldConfig(
-                    enable_normalization=True,
-                    enable_ml_layers=False,
-                    enable_provenance=True,
-                ),
-            )
+        # Agents use regex + provenance only for local RAG scanning.
+        # ML-grade scanning (TinyBERT/DeBERTa) runs in the sidecar to avoid
+        # duplicating ~1GB of models per process.
+        shield = MemShield(
+            collection=collection,
+            config=ShieldConfig(
+                enable_normalization=True,
+                enable_ml_layers=False,
+                enable_provenance=True,
+            ),
+        )
 
         if collection.count() == 0:
             ids = [f"kb_{i}" for i in range(len(_SEED_DOCS))]
@@ -251,30 +243,29 @@ def screen_sig(elems: list) -> str:
     return str(sorted(parts))
 
 
+_ALLOWED_PACKAGES = {
+    "todolist.scheduleplanner.dailyplanner.todo.reminders",
+    "com.google.android.deskclock",
+    "com.android.chrome",
+    "com.google.android.calendar",
+    "com.termux",
+    "com.android.launcher3",
+    "com.android.settings",
+}
+
+_DANGEROUS_TYPE_PATTERNS = re.compile(
+    r"(?i)("
+    r"https?://|adb\s+shell|su\s+-c|pm\s+grant|pm\s+install|"
+    r"am\s+start.*-d\s+|curl\s+|wget\s+|rm\s+-rf|chmod\s+[0-7]{3}"
+    r")"
+)
+
+
 def execute_action(d, action: str, params: dict) -> str:
     """
     Execute action with PRISM verification for sensitive ops.
     Returns: "ok", "blocked_by_prism", "not_found", "error", or action result.
     """
-    import re as _re
-
-    _ALLOWED_PACKAGES = {
-        "todolist.scheduleplanner.dailyplanner.todo.reminders",
-        "com.google.android.deskclock",
-        "com.android.chrome",
-        "com.google.android.calendar",
-        "com.termux",
-        "com.android.launcher3",
-        "com.android.settings",
-    }
-
-    _DANGEROUS_TYPE_PATTERNS = _re.compile(
-        r"(?i)("
-        r"https?://|adb\s+shell|su\s+-c|pm\s+grant|pm\s+install|"
-        r"am\s+start.*-d\s+|curl\s+|wget\s+|rm\s+-rf|chmod\s+[0-7]{3}"
-        r")"
-    )
-
     # ALL taps go through PRISM
     if action == "tap":
         tap_text = params.get("text", "") + params.get("desc", "")
@@ -516,8 +507,7 @@ def run(task: str, serial: str = SERIAL, learn: bool = False):
     memshield = _setup_rag()
     if memshield:
         kb_count = memshield.collection.count() if memshield.collection else 0
-        ml_status = "6-layer" if memshield._tinybert else "regex+provenance"
-        print(f"  RAG: {CYAN}ACTIVE{RESET} ({kb_count} docs, persistent, {ml_status})")
+        print(f"  RAG: {CYAN}ACTIVE{RESET} ({kb_count} docs, persistent, regex+provenance; ML via sidecar)")
         if learn:
             print(f"  Learn: {CYAN}ON{RESET} (successful sequences saved to KB)")
     else:

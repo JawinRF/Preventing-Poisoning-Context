@@ -511,26 +511,17 @@ def _setup_rag(enable_prism: bool) -> "MemShield | None":
         client = chromadb.PersistentClient(path=db_path)
         collection = client.get_or_create_collection("agent_kb")
 
-        # Try with ML layers on for full defense; fall back if torch missing
-        try:
-            shield = MemShield(
-                collection=collection,
-                config=ShieldConfig(
-                    enable_normalization=enable_prism,
-                    enable_ml_layers=enable_prism,
-                    enable_provenance=True,
-                ),
-            )
-        except ImportError:
-            logger.warning("ML layers unavailable — RAG using regex + provenance only")
-            shield = MemShield(
-                collection=collection,
-                config=ShieldConfig(
-                    enable_normalization=enable_prism,
-                    enable_ml_layers=False,
-                    enable_provenance=True,
-                ),
-            )
+        # Agents use regex + provenance only for local RAG scanning.
+        # ML-grade scanning (TinyBERT/DeBERTa) runs in the sidecar to avoid
+        # duplicating ~1GB of models per process.
+        shield = MemShield(
+            collection=collection,
+            config=ShieldConfig(
+                enable_normalization=enable_prism,
+                enable_ml_layers=False,
+                enable_provenance=True,
+            ),
+        )
 
         # Seed only on first run (persistent DB survives restarts).
         # Seeds are trusted internal content — use add_with_provenance directly
@@ -632,8 +623,7 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
     memshield = _setup_rag(enable_prism)
     if memshield:
         kb_count = memshield.collection.count() if memshield.collection else 0
-        ml_status = "6-layer" if memshield._tinybert else "regex+provenance"
-        print(f"  RAG: {CYAN}ACTIVE{RESET} ({kb_count} docs, persistent, {ml_status})")
+        print(f"  RAG: {CYAN}ACTIVE{RESET} ({kb_count} docs, persistent, regex+provenance; ML via sidecar)")
         if learn:
             print(f"  Learn: {CYAN}ON{RESET} (successful sequences saved to KB)")
     else:

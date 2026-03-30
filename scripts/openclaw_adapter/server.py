@@ -56,7 +56,7 @@ DEFAULT_HOST = os.getenv("PRISM_SIDECAR_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.getenv("PRISM_SIDECAR_PORT", "8765"))
 ENABLE_MEMSHIELD_RAG = os.getenv("PRISM_ENABLE_MEMSHIELD_RAG", "1").lower() not in {"0", "false", "no"}
 UI_EXTRACTOR = UIExtractor()
-_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+_EXECUTOR = ThreadPoolExecutor(max_workers=8)
 
 # ── Rate Limiter ─────────────────────────────────────────────────────────────
 
@@ -283,16 +283,17 @@ def handle_get_ticket(ticket_id: str) -> dict:
 
 
 def handle_inspect_batch(items: list[dict]) -> list[dict]:
-    """Process multiple inspect requests in parallel."""
-    futures = []
-    for item in items:
-        req = _validate_model(InspectRequest, item)
-        futures.append(_EXECUTOR.submit(handle_inspect, req))
+    """Process multiple inspect requests sequentially.
 
+    NOTE: handle_inspect already submits work to _EXECUTOR internally,
+    so we must NOT submit handle_inspect itself to _EXECUTOR — that would
+    cause nested executor submissions and deadlock under load.
+    """
     results = []
-    for f in futures:
+    for item in items:
         try:
-            resp = f.result(timeout=20)
+            req = _validate_model(InspectRequest, item)
+            resp = handle_inspect(req)
             results.append(_model_dump(resp))
         except Exception:
             results.append({
