@@ -312,7 +312,7 @@ AI Agent (Claude API)
 Actions on phone (tap, type, open app, etc.)
 ```
 
-All 7 data paths from the phone are filtered by PRISM **before** reaching the AI.
+All 6 data paths from the phone are filtered by PRISM **before** reaching the AI (network monitoring planned).
 
 ---
 

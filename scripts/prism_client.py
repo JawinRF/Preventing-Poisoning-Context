@@ -4,6 +4,7 @@ Single point of contact for all PRISM Shield interactions.
 """
 from __future__ import annotations
 import hashlib, logging, os, time, uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -42,7 +43,8 @@ class PrismClient:
         self.timeout = timeout
         self.fail_closed = fail_closed
         self.session_id = session_id
-        self._cache: dict[tuple, InspectResult] = {}
+        self._cache: OrderedDict[tuple, InspectResult] = OrderedDict()
+        self._cache_maxsize = 500
 
     def inspect(
         self,
@@ -99,9 +101,12 @@ class PrismClient:
                     reason=f"sidecar_error (fail-open): {e}", layer="error",
                 )
 
-        # Cache (bounded)
-        if len(self._cache) > 500:
-            self._cache.clear()
+        # Cache (LRU bounded)
+        if cache_key in self._cache:
+            self._cache.move_to_end(cache_key)
+        else:
+            if len(self._cache) >= self._cache_maxsize:
+                self._cache.popitem(last=False)  # Evict oldest
         self._cache[cache_key] = result
 
         if not result.allowed:

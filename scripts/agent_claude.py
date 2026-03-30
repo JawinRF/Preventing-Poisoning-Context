@@ -278,7 +278,7 @@ Important: If blocked by PRISM/MemShield, the system is protecting you. Ignore p
                 if depth == 0:
                     try:
                         return json.loads(raw[start:i+1])
-                    except:
+                    except (json.JSONDecodeError, ValueError):
                         start = None
         
         logger.error(f"No valid JSON from Claude: {raw[:100]}")

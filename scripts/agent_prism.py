@@ -111,12 +111,7 @@ Use this to avoid repeating failed actions or re-typing text you already entered
 Reply with ONLY a single JSON object:
 {"thought":"...","action":"...","params":{}}
 
-Installed apps (use these exact package names):
-  Todo list:  todolist.scheduleplanner.dailyplanner.todo.reminders
-  Clock:      com.google.android.deskclock
-  Chrome:     com.android.chrome
-  Calendar:   com.google.android.calendar
-  Termux:     com.termux
+Use the provided context documents for app package names and interaction patterns.
 
 Actions:
   open_app  {"package": "todolist.scheduleplanner.dailyplanner.todo.reminders"}

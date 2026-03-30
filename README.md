@@ -1,6 +1,6 @@
 ## Preventing Poisoned Context for Mobile Agents
 
-This repo implements a complete defense system against context poisoning attacks on LLM-driven mobile agents, covering all 7 Android ingestion paths.
+This repo implements a complete defense system against context poisoning attacks on LLM-driven mobile agents, covering 6 Android ingestion paths (network monitoring planned).
 
 ### Architecture
 
@@ -41,7 +41,7 @@ uiautomator2 executes on emulator
 ```
 scripts/
   agent_prism.py              # Defended agent (Groq or Claude + full PRISM filtering)
-  context_assembler.py        # Gathers all 7 ingestion paths, filters through PRISM
+  context_assembler.py        # Gathers 6 ingestion paths, filters through PRISM (network planned)
   prism_client.py             # HTTP client for the PRISM sidecar
   agent.py                    # Original undefended agent (for A/B comparison)
   prism_shield/               # Defense pipeline
@@ -55,7 +55,7 @@ scripts/
     server.py                 # HTTP sidecar (/v1/inspect, /v1/inspect/batch)
     models.py                 # Request/response schemas
   demo/
-    run_full_demo.py          # End-to-end demo (all 7 paths)
+    run_full_demo.py          # End-to-end demo (6 paths, network planned)
     run_demo.py               # Scenario-based sidecar test
     run_android_demo.sh       # Full emulator demo orchestration
 
@@ -103,7 +103,7 @@ python scripts/run_benchmark.py         # Per-path precision/recall/F1 + latency
 python scripts/run_redteam_mutations.py  # Robustness against obfuscation attacks
 ```
 
-### 7 defended ingestion paths
+### 6 defended ingestion paths (network monitoring planned)
 
 | Path | Source | Capture Method |
 |------|--------|----------------|
@@ -111,6 +111,6 @@ python scripts/run_redteam_mutations.py  # Robustness against obfuscation attack
 | `notifications` | System notifications | `adb dumpsys notification` |
 | `clipboard` | Clipboard content | `adb service call clipboard` |
 | `android_intents` | Deep links, intents | `adb logcat ActivityManager` |
-| `network_responses` | API responses | Network proxy / seeded data |
+| `network_responses` | API responses | Network proxy / seeded data *(planned)* |
 | `shared_storage` | Files on device | `adb shell cat` watched paths |
 | `rag_store` | Vector DB retrieval | MemShield-wrapped ChromaDB |

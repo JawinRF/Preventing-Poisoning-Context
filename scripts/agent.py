@@ -107,7 +107,7 @@ Rules:
 def read_screen(d):
     try:
         root = ET.fromstring(d.dump_hierarchy())
-    except:
+    except ET.ParseError:
         return []
     elems = []
     for node in root.iter():
@@ -363,7 +363,7 @@ def ask(task, screen, screen_changed, step):
                     if depth == 0:
                         try:
                             return json.loads(raw[start:i+1])
-                        except:
+                        except (json.JSONDecodeError, ValueError):
                             start = None
             logger.error(f"No valid JSON in: {raw[:150]}")
             return {"thought": "error", "action": "fail", "params": {"reason": "invalid json"}}

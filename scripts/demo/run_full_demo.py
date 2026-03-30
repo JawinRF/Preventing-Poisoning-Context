@@ -2,7 +2,7 @@
 """
 run_full_demo.py — End-to-end PRISM Shield demonstration.
 
-Shows how PRISM defends a mobile agent across all 7 ingestion paths by:
+Shows how PRISM defends a mobile agent across 6 ingestion paths (network planned) by:
 1. Starting the Python sidecar (if not already running)
 2. Seeding poisoned data across multiple paths
 3. Running the defended agent
@@ -188,7 +188,7 @@ SCENARIOS = [
 
 def run_scenarios() -> dict:
     """Run all test scenarios against the sidecar."""
-    header("PRISM Shield — All 7 Ingestion Paths")
+    header("PRISM Shield — 6 Ingestion Paths (network planned)")
 
     results = {"passed": 0, "failed": 0, "total": len(SCENARIOS)}
     path_stats = {}
