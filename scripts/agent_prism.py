@@ -715,7 +715,8 @@ def ingest_files(file_paths: list[str], enable_prism: bool = True):
 
 
 def run(task: str, serial: str = SERIAL, llm: str = "groq",
-        enable_prism: bool = True, learn: bool = False):
+        enable_prism: bool = True, learn: bool = False,
+        watch_paths: list[str] | None = None):
     print(f"\n{CYAN}{'='*60}{RESET}")
     print(f"  {BOLD}PRISM Agent — {'DEFENDED' if enable_prism else 'UNDEFENDED'}{RESET}")
     print(f"  Task: {task}")
@@ -754,7 +755,8 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
         prism=prism,
         serial=serial,
         memshield=memshield,
-        watched_paths=[
+        # Demo-scoped watched paths — extend via --watch-path for broader coverage
+        watched_paths=watch_paths or [
             "/sdcard/Download/.prism_test.txt",
             "/sdcard/Documents/notes.txt",
         ],
@@ -966,11 +968,14 @@ if __name__ == "__main__":
     p.add_argument("--no-prism", action="store_true", help="Disable PRISM (for A/B testing)")
     p.add_argument("--learn", action="store_true", help="Record successful sequences to RAG KB")
     p.add_argument("--ingest", nargs="+", metavar="FILE", help="Ingest documents into RAG KB")
+    p.add_argument("--watch-path", nargs="+", dest="watch_paths", metavar="PATH",
+                   help="Device file paths to monitor (default: demo paths)")
     a = p.parse_args()
 
     if a.ingest:
         ingest_files(a.ingest, enable_prism=not a.no_prism)
         sys.exit(0)
 
-    success = run(a.task, a.serial, a.llm, enable_prism=not a.no_prism, learn=a.learn)
+    success = run(a.task, a.serial, a.llm, enable_prism=not a.no_prism, learn=a.learn,
+                  watch_paths=a.watch_paths)
     sys.exit(0 if success else 1)

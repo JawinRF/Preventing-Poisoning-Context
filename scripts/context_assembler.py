@@ -1,5 +1,5 @@
 """
-context_assembler.py — Gathers context from 6 Android ingestion paths,
+context_assembler.py — Gathers context from 9 defended ingestion paths,
 filters each through the PRISM Shield sidecar, and returns a clean
 AssembledContext that the agent LLM can safely consume.
 (Network response monitoring is planned but not yet implemented.)
@@ -63,6 +63,14 @@ class AssembledContext:
             d["calendar_events"] = [
                 f"{e['title']}: {e['description']}" for e in self.calendar_events
             ]
+        if self.intent_data:
+            d["recent_intents"] = [
+                f"{i['type']}: {i['data']}" for i in self.intent_data
+            ]
+        if self.storage_data:
+            d["watched_files"] = [
+                f"{f['path']}: {f['content'][:200]}" for f in self.storage_data
+            ]
         if self.clipboard:
             d["clipboard"] = self.clipboard
         if self.rag_context:
@@ -94,7 +102,7 @@ class Notification:
 
 class ContextAssembler:
     """
-    Gathers context from 6 Android ingestion paths, filters each
+    Gathers context from 9 defended ingestion paths, filters each
     through the PRISM Shield sidecar, and returns only clean data.
     """
 

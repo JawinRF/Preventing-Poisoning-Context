@@ -1,13 +1,14 @@
 ## Preventing Poisoned Context for Mobile Agents
 
-This repo implements a complete defense system against context poisoning attacks on LLM-driven mobile agents, covering 6 Android ingestion paths (network monitoring planned).
+This repo implements a complete defense system against context poisoning attacks on LLM-driven mobile agents, covering 9 Android ingestion paths (network monitoring planned).
 
 ### Architecture
 
 ```
 Android Emulator
   ├─ dump_hierarchy()           → ui_accessibility
-  ├─ adb dumpsys notification   → notifications
+  ├─ PrismNotificationListener  → notifications (via TCP socket)
+  ├─ ContentProviderReader      → sms, contacts, calendar (via TCP socket)
   ├─ adb clipboard              → clipboard
   ├─ adb logcat (intents)       → android_intents
   ├─ adb shell cat              → shared_storage
@@ -41,7 +42,7 @@ uiautomator2 executes on emulator
 ```
 scripts/
   agent_prism.py              # Defended agent (Groq or Claude + full PRISM filtering)
-  context_assembler.py        # Gathers 6 ingestion paths, filters through PRISM (network planned)
+  context_assembler.py        # Gathers 9 ingestion paths, filters through PRISM (network planned)
   prism_client.py             # HTTP client for the PRISM sidecar
   agent.py                    # Original undefended agent (for A/B comparison)
   prism_shield/               # Defense pipeline
@@ -55,7 +56,7 @@ scripts/
     server.py                 # HTTP sidecar (/v1/inspect, /v1/inspect/batch)
     models.py                 # Request/response schemas
   demo/
-    run_full_demo.py          # End-to-end demo (6 paths, network planned)
+    run_full_demo.py          # End-to-end demo (9 paths, network planned)
     run_demo.py               # Scenario-based sidecar test
     run_android_demo.sh       # Full emulator demo orchestration
 
@@ -94,7 +95,8 @@ python scripts/agent_prism.py --task "Set alarm for 9 AM" --no-prism
 | Service | Port | Purpose |
 |---------|------|---------|
 | Python PRISM sidecar | 8765 | Agent's primary filter (Layer 1+2+3) |
-| Android PrismShieldService | 8766 | On-device dashboard, clipboard/notification hooks |
+| Android PrismShieldService | 8766 | On-device dashboard, clipboard hooks |
+| PrismNotificationListener | 8767 | Notifications, SMS, contacts, calendar (TCP via ADB forward) |
 
 ### Benchmark
 
@@ -103,14 +105,18 @@ python scripts/run_benchmark.py         # Per-path precision/recall/F1 + latency
 python scripts/run_redteam_mutations.py  # Robustness against obfuscation attacks
 ```
 
-### 6 defended ingestion paths (network monitoring planned)
+### 9 defended ingestion paths (network monitoring planned)
 
 | Path | Source | Capture Method |
 |------|--------|----------------|
 | `ui_accessibility` | Screen content | `uiautomator2.dump_hierarchy()` |
-| `notifications` | System notifications | `adb dumpsys notification` |
+| `notifications` | System notifications | `PrismNotificationListener` TCP socket |
+| `sms` | SMS inbox | `ContentProviderReader` TCP socket |
+| `contacts` | Contact notes | `ContentProviderReader` TCP socket |
+| `calendar` | Calendar events | `ContentProviderReader` TCP socket |
 | `clipboard` | Clipboard content | `adb service call clipboard` |
 | `android_intents` | Deep links, intents | `adb logcat ActivityManager` |
-| `network_responses` | API responses | Network proxy / seeded data *(planned)* |
 | `shared_storage` | Files on device | `adb shell cat` watched paths |
 | `rag_store` | Vector DB retrieval | MemShield-wrapped ChromaDB |
+
+*`network_responses` (API responses via network proxy) is planned but not yet implemented.*
