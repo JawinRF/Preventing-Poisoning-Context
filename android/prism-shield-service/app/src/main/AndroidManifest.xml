@@ -17,6 +17,15 @@
         tools:ignore="ProtectedPermissions"
         xmlns:tools="http://schemas.android.com/tools"/>
 
+    <!-- SMS (for new ingestion path defense) -->
+    <uses-permission android:name="android.permission.READ_SMS" />
+
+    <!-- Contacts (for new ingestion path defense) -->
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+
+    <!-- Calendar (for new ingestion path defense) -->
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
+
     <!-- Accessibility service for WindowContextBridge -->
     <uses-permission android:name="android.permission.BIND_ACCESSIBILITY_SERVICE"
         tools:ignore="ProtectedPermissions"

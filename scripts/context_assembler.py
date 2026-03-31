@@ -26,11 +26,15 @@ class AssembledContext:
     screen_changed: bool = True
     ui_elements: list[dict] = field(default_factory=list)
     notifications: list[dict] = field(default_factory=list)
+    sms_messages: list[dict] = field(default_factory=list)
+    contacts: list[dict] = field(default_factory=list)
+    calendar_events: list[dict] = field(default_factory=list)
     clipboard: str | None = None
     intent_data: list[dict] = field(default_factory=list)
     storage_data: list[dict] = field(default_factory=list)
     rag_context: list[str] = field(default_factory=list)
     blocked_counts: dict[str, int] = field(default_factory=dict)
+    degraded_paths: list[str] = field(default_factory=list)  # paths that failed to read
     audit_trail: list[dict] = field(default_factory=list)
     screenshot_path: str | None = None  # For VLM verification on QUARANTINE
 
@@ -47,6 +51,18 @@ class AssembledContext:
                 f"[{n['package']}] {n['title']}: {n['text']}"
                 for n in self.notifications
             ]
+        if self.sms_messages:
+            d["sms_messages"] = [
+                f"[{m['address']}] {m['body']}" for m in self.sms_messages
+            ]
+        if self.contacts:
+            d["contact_notes"] = [
+                f"[{c['name']}] {c['note']}" for c in self.contacts
+            ]
+        if self.calendar_events:
+            d["calendar_events"] = [
+                f"{e['title']}: {e['description']}" for e in self.calendar_events
+            ]
         if self.clipboard:
             d["clipboard"] = self.clipboard
         if self.rag_context:
@@ -57,6 +73,12 @@ class AssembledContext:
             d["security_note"] = (
                 f"PRISM Shield filtered {total_blocked} potentially malicious "
                 f"item(s) from your context. Proceed with the legitimate task."
+            )
+        if self.degraded_paths:
+            d["degraded_paths"] = (
+                f"WARNING: These context sources are unavailable: "
+                f"{', '.join(self.degraded_paths)}. "
+                f"An attacker could be hiding activity in these channels."
             )
         return d
 
@@ -116,8 +138,29 @@ class ContextAssembler:
         ctx.screen_changed = current_sig != last_sig
 
         # 2. Notifications
-        ctx.notifications, notif_blocked = self._gather_notifications()
-        ctx.blocked_counts["notifications"] = notif_blocked
+        try:
+            ctx.notifications, notif_blocked = self._gather_notifications()
+            ctx.blocked_counts["notifications"] = notif_blocked
+        except Exception as e:
+            logger.warning(f"notifications ingestion failed: {e}")
+            ctx.blocked_counts["notifications"] = 0
+            ctx.degraded_paths.append("notifications")
+
+        # 2b–2d. Socket-based paths (SMS, Contacts, Calendar)
+        # Track transport failures as degraded paths so the LLM knows
+        for name, gatherer, attr in [
+            ("sms", self._gather_sms, "sms_messages"),
+            ("contacts", self._gather_contacts, "contacts"),
+            ("calendar", self._gather_calendar, "calendar_events"),
+        ]:
+            try:
+                data, blocked = gatherer()
+                setattr(ctx, attr, data)
+                ctx.blocked_counts[name] = blocked
+            except Exception as e:
+                logger.warning(f"{name} ingestion failed: {e}")
+                ctx.blocked_counts[name] = 0
+                ctx.degraded_paths.append(name)
 
         # 3. Clipboard
         ctx.clipboard, clip_blocked = self._gather_clipboard()
@@ -289,19 +332,27 @@ class ContextAssembler:
 
     # ── 2. Notifications ─────────────────────────────────────────────────────
 
+    _NOTIF_PORT = 8767  # Must match PrismNotificationListener.NOTIF_PORT
+
+    def _ensure_adb_forward(self):
+        """Set up ADB port forward to the device's TCP socket (idempotent)."""
+        try:
+            subprocess.run(
+                ["adb", "-s", self.serial, "forward",
+                 f"tcp:{self._NOTIF_PORT}", f"tcp:{self._NOTIF_PORT}"],
+                capture_output=True, timeout=3,
+            )
+        except Exception as e:
+            logger.warning(f"ADB forward setup failed: {e}")
+
     def _gather_notifications(self) -> tuple[list[dict], int]:
         """Read active notifications via native Android socket.
-        
-        Raises exception if native socket fails (no silent fallback to ADB).
-        This ensures the native pipeline is always used and any issues are visible.
+
+        Returns empty list on socket failure (fail-open for non-security path).
         """
-        # Native socket only (PrismNotificationListener)
         notifications = self._gather_notifications_native()
         if notifications is None:
-            raise RuntimeError(
-                "Native notification socket unavailable. "
-                "Ensure PrismNotificationListener service is running on the device."
-            )
+            raise OSError("Native notification socket unavailable")
 
         if not notifications:
             return [], 0
@@ -337,25 +388,8 @@ class ContextAssembler:
 
     def _gather_notifications_native(self) -> list[Notification] | None:
         """Read notifications via native Android socket from PrismNotificationListener."""
-        LOCAL_PORT = 8767  # Fixed local port for ADB forward
-
         try:
-            # Forward local:LOCAL_PORT to device's localabstract:prism_notif socket
-            subprocess.run(
-                ["adb", "-s", self.serial, "forward", f"tcp:{LOCAL_PORT}", "localabstract:prism_notif"],
-                capture_output=True, timeout=3,
-            )
-
-            # Connect via forwarded port
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(3)
-            sock.connect(("127.0.0.1", LOCAL_PORT))
-
-            sock.send(b'{"action":"list"}\n')
-            response = sock.recv(4096).decode("utf-8")
-            sock.close()
-
-            data = json.loads(response)
+            data = self._socket_request("list_notifications")
             notifications = []
             for n in data.get("notifications", []):
                 notifications.append(
@@ -372,6 +406,132 @@ class ContextAssembler:
         except Exception as e:
             logger.debug(f"Native notification socket unavailable: {e}")
             return None
+
+    # ── 2b. SMS ───────────────────────────────────────────────────────────────
+
+    def _gather_sms(self) -> tuple[list[dict], int]:
+        """Read SMS messages via native Android socket."""
+        try:
+            data = self._socket_request("get_sms")
+            sms_list = data.get("sms", [])
+
+            if not sms_list:
+                return [], 0
+
+            allowed = []
+            blocked = 0
+
+            for msg in sms_list:
+                text = msg.get("body", "")
+                if not text:
+                    continue
+
+                r = self.prism.inspect(
+                    text=text,
+                    ingestion_path="sms",
+                    source_type="sms",
+                    source_name=msg.get("address", "unknown"),
+                )
+
+                if r.allowed:
+                    allowed.append({
+                        "id": msg.get("id"),
+                        "address": msg.get("address"),
+                        "body": text,
+                    })
+                else:
+                    blocked += 1
+                    logger.warning(f"SMS BLOCKED: [{msg.get('address')}] '{text[:60]}'")
+
+            return allowed, blocked
+
+        except Exception as e:
+            raise OSError(f"SMS socket unavailable: {e}") from e
+
+    # ── 2c. Contacts ──────────────────────────────────────────────────────────
+
+    def _gather_contacts(self) -> tuple[list[dict], int]:
+        """Read contacts with notes via native Android socket."""
+        try:
+            data = self._socket_request("get_contacts")
+            contacts_list = data.get("contacts", [])
+
+            if not contacts_list:
+                return [], 0
+
+            allowed = []
+            blocked = 0
+
+            for contact in contacts_list:
+                note = contact.get("note", "")
+                if not note:
+                    continue
+
+                r = self.prism.inspect(
+                    text=note,
+                    ingestion_path="contacts",
+                    source_type="contact",
+                    source_name=contact.get("name", "unknown"),
+                )
+
+                if r.allowed:
+                    allowed.append({
+                        "id": contact.get("id"),
+                        "name": contact.get("name"),
+                        "note": note,
+                    })
+                else:
+                    blocked += 1
+                    logger.warning(f"Contact note BLOCKED: [{contact.get('name')}] '{note[:60]}'")
+
+            return allowed, blocked
+
+        except Exception as e:
+            raise OSError(f"Contacts socket unavailable: {e}") from e
+
+    # ── 2d. Calendar ──────────────────────────────────────────────────────────
+
+    def _gather_calendar(self) -> tuple[list[dict], int]:
+        """Read calendar events via native Android socket."""
+        try:
+            data = self._socket_request("get_calendar")
+            events_list = data.get("calendar", [])
+
+            if not events_list:
+                return [], 0
+
+            allowed = []
+            blocked = 0
+
+            for event in events_list:
+                description = event.get("description", "")
+                title = event.get("title", "")
+                text = f"{title} {description}".strip()
+
+                if not text:
+                    continue
+
+                r = self.prism.inspect(
+                    text=text,
+                    ingestion_path="calendar",
+                    source_type="calendar_event",
+                    source_name=event.get("id", "unknown"),
+                )
+
+                if r.allowed:
+                    allowed.append({
+                        "id": event.get("id"),
+                        "title": title,
+                        "description": description,
+                    })
+                else:
+                    blocked += 1
+                    logger.warning(f"Calendar event BLOCKED: [{title}] '{text[:60]}'")
+
+            return allowed, blocked
+
+        except Exception as e:
+            raise OSError(f"Calendar socket unavailable: {e}") from e
 
     # ── 3. Clipboard ─────────────────────────────────────────────────────────
 
@@ -530,6 +690,32 @@ class ContextAssembler:
         except Exception as e:
             logger.warning(f"RAG query failed: {e}")
             return [], 0
+
+    # ── Socket helpers ────────────────────────────────────────────────────────
+
+    def _socket_request(self, action: str) -> dict:
+        """Send a JSON action to the device socket and read the full response.
+
+        Reads until the server closes the connection, so large payloads
+        (50 SMS, contacts, calendar events) are never truncated.
+        """
+        self._ensure_adb_forward()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        try:
+            sock.connect(("127.0.0.1", self._NOTIF_PORT))
+            sock.sendall(json.dumps({"action": action}).encode() + b"\n")
+
+            chunks: list[bytes] = []
+            while True:
+                chunk = sock.recv(16384)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+
+            return json.loads(b"".join(chunks).decode("utf-8"))
+        finally:
+            sock.close()
 
     # ── Utilities ────────────────────────────────────────────────────────────
 

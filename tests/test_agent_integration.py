@@ -94,20 +94,26 @@ class TestOutgoingActionDefense:
         mock_prism.inspect.assert_called_once()
 
 
-class TestLoopDetection:
-    """Test that loop detection fires correctly."""
+class TestReflectionFallback:
+    """Test that reflection defaults to 'C' (uncertain) on failure, not 'A' (success)."""
 
-    def test_loop_detector_escapes(self):
-        """After repeated identical actions, loop detector should override."""
-        from agent_prism import LoopDetector
-        ld = LoopDetector()
-        # Simulate 5 identical taps with no screen change
-        for _ in range(5):
-            ld.record("tap", {"text": "OK"}, screen_changed=False)
-        override = ld.check("tap", {"text": "OK"})
-        # Should return an escape action (back or home)
-        assert override is not None
-        assert override["action"] in ("press",)
+    def test_reflection_defaults_to_uncertain(self):
+        """Reflection should return 'C' on error, not silently report success."""
+        from agent_prism import ask_reflection
+        # Call with a non-existent LLM backend — will hit the final fallback
+        result = ask_reflection(
+            llm_backend="nonexistent",
+            task="test",
+            action="tap({'text': 'OK'})",
+            params={"text": "OK"},
+            summary="tap OK button",
+            add_info="",
+            screen_before=[{"text": "OK", "class": "Button"}],
+            screen_after=[{"text": "OK", "class": "Button"}],
+            keyboard_before=False,
+            keyboard_after=False,
+        )
+        assert result == "C", f"Expected 'C' (uncertain) on error, got '{result}'"
 
 
 class TestPrismClientCache:

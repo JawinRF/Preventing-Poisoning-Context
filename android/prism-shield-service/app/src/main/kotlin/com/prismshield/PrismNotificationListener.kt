@@ -15,27 +15,26 @@ import java.util.concurrent.CopyOnWriteArrayList
 /**
  * Hooks ALL incoming notifications.
  * Extracts text and forwards to PrismShieldService via broadcast.
- * Also serves active notifications via local socket for Python sidecar.
+ * Also serves notifications, SMS, Contacts, Calendar via local socket for Python sidecar.
  *
  * Must be declared in AndroidManifest.xml with BIND_NOTIFICATION_LISTENER_SERVICE permission.
  * User must grant via: Settings > Notifications > Notification Access
  *
  * Socket API:
- *   - Connect to /data/local/tmp/prism_notif.sock
- *   - Send: {"action":"list"}
- *   - Response: {"notifications":[{"package":"...","title":"...","text":"...","id":...}]}
- *   - Send: {"action":"dismiss","id":...}
- *   - Send: {"action":"reply","id":"...","text":"..."}
+ *   - Connect to port 8767
+ *   - Actions: list_notifications, get_sms, get_contacts, get_calendar
+ *   - Example: {"action":"get_sms"}
+ *   - Response: JSON with the requested data
  */
 class PrismNotificationListener : NotificationListenerService() {
 
     companion object {
-        const val SOCKET_PATH = "/data/local/tmp/prism_notif.sock"
         const val NOTIF_PORT = 8767  // Fixed port for Python to connect via ADB forward
     }
 
     private val activeNotifications = CopyOnWriteArrayList<NotificationEntry>()
     private var serverThread: Thread? = null
+    private lateinit var contentReader: ContentProviderReader
 
     data class NotificationEntry(
         val id: String,
@@ -47,6 +46,7 @@ class PrismNotificationListener : NotificationListenerService() {
 
     override fun onCreate() {
         super.onCreate()
+        contentReader = ContentProviderReader(this)
         startSocketServer()
     }
 
@@ -137,7 +137,10 @@ class PrismNotificationListener : NotificationListenerService() {
             val action = json.optString("action", "")
 
             return when (action) {
-                "list" -> handleList()
+                "list_notifications" -> handleList()
+                "get_sms" -> handleGetSms()
+                "get_contacts" -> handleGetContacts()
+                "get_calendar" -> handleGetCalendar()
                 "dismiss" -> handleDismiss(json)
                 "reply" -> handleReply(json)
                 else -> jsonError("Unknown action: $action")
@@ -159,6 +162,36 @@ class PrismNotificationListener : NotificationListenerService() {
             })
         }
         return JSONObject().put("notifications", notifs).toString()
+    }
+
+    private fun handleGetSms(): String {
+        return try {
+            val messages = contentReader.getSmsMessages()
+            val jsonStr = contentReader.smsToJson(messages)
+            JSONObject().put("sms", JSONArray(jsonStr)).toString()
+        } catch (e: Exception) {
+            jsonError("Failed to read SMS: ${e.message}")
+        }
+    }
+
+    private fun handleGetContacts(): String {
+        return try {
+            val contacts = contentReader.getContacts()
+            val jsonStr = contentReader.contactsToJson(contacts)
+            JSONObject().put("contacts", JSONArray(jsonStr)).toString()
+        } catch (e: Exception) {
+            jsonError("Failed to read contacts: ${e.message}")
+        }
+    }
+
+    private fun handleGetCalendar(): String {
+        return try {
+            val events = contentReader.getCalendarEvents()
+            val jsonStr = contentReader.calendarToJson(events)
+            JSONObject().put("calendar", JSONArray(jsonStr)).toString()
+        } catch (e: Exception) {
+            jsonError("Failed to read calendar: ${e.message}")
+        }
     }
 
     private fun handleDismiss(json: JSONObject): String {
