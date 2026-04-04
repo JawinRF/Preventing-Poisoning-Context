@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OpenClaw PRISM</string>
+    <string name="notification_channel_id">openclaw_service</string>
+    <string name="notification_channel_name">OpenClaw PRISM Service</string>
+    <string name="notification_title">OpenClaw PRISM is running</string>
+    <string name="notification_text">Terminal + PRISM Shield active</string>
+    <string name="accessibility_service_description">PRISM Shield monitors the UI tree for context poisoning attacks against mobile agents.</string>
+</resources>

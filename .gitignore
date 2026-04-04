@@ -74,5 +74,12 @@ data/tinybert_training_dataset.parquet
 view.xml
 
 # ChromaDB runtime data
-data/chromadb/
+data/
 
+openclaw-android/
+
+POC_PRESENTATION.md
+
+.codex
+
+DEMO_INSTRUCTIONS.md
