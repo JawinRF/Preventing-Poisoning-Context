@@ -22,8 +22,15 @@ export interface PrismResponse {
   audit: Record<string, unknown>;
 }
 
+export interface SidecarHealth {
+  status: string;
+  uptime?: number;
+  version?: string;
+}
+
 export interface PluginConfig {
   sidecarUrl: string;
+  fallbackSidecarUrl: string;
   timeoutMs: number;
   failClosed: boolean;
   secret?: string;

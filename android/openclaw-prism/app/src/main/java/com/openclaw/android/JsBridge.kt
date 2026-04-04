@@ -476,14 +476,24 @@ class JsBridge(
     }
 
     @JavascriptInterface
-    fun getSidecarHealth(): String = try {
-        val url = java.net.URL("http://127.0.0.1:8765/health")
-        val conn = url.openConnection() as java.net.HttpURLConnection
-        conn.connectTimeout = 2000; conn.readTimeout = 2000
-        val body = conn.inputStream.bufferedReader().readText(); conn.disconnect()
-        gson.toJson(mapOf("python_sidecar" to "online", "response" to body))
-    } catch (_: Exception) {
-        gson.toJson(mapOf("python_sidecar" to "offline"))
+    fun getSidecarHealth(): String {
+        val pythonStatus = try {
+            val url = java.net.URL("http://127.0.0.1:8765/health")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.connectTimeout = 2000; conn.readTimeout = 2000
+            conn.inputStream.bufferedReader().readText(); conn.disconnect()
+            "up"
+        } catch (_: Exception) { "down" }
+
+        val androidStatus = try {
+            val url = java.net.URL("http://127.0.0.1:8766/health")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.connectTimeout = 2000; conn.readTimeout = 2000
+            conn.inputStream.bufferedReader().readText(); conn.disconnect()
+            "up"
+        } catch (_: Exception) { "down" }
+
+        return gson.toJson(mapOf("python_sidecar" to pythonStatus, "android_sidecar" to androidStatus))
     }
 
     @JavascriptInterface
@@ -492,9 +502,9 @@ class JsBridge(
         fun hasPermission(perm: String): Boolean =
             androidx.core.content.ContextCompat.checkSelfPermission(ctx, perm) == android.content.pm.PackageManager.PERMISSION_GRANTED
         return gson.toJson(mapOf(
-            "read_sms" to hasPermission(android.Manifest.permission.READ_SMS),
-            "read_contacts" to hasPermission(android.Manifest.permission.READ_CONTACTS),
-            "read_calendar" to hasPermission(android.Manifest.permission.READ_CALENDAR),
+            "sms" to hasPermission(android.Manifest.permission.READ_SMS),
+            "contacts" to hasPermission(android.Manifest.permission.READ_CONTACTS),
+            "calendar" to hasPermission(android.Manifest.permission.READ_CALENDAR),
         ))
     }
 

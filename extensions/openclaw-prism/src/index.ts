@@ -7,6 +7,7 @@ import type { PluginConfig } from "./types.js";
 
 export const defaultConfig: PluginConfig = {
   sidecarUrl: "http://127.0.0.1:8765",
+  fallbackSidecarUrl: "http://127.0.0.1:8766",
   timeoutMs: 500,
   failClosed: true,
   quarantineMode: "exclude",
@@ -23,6 +24,7 @@ const pluginConfigSchema = {
   additionalProperties: false,
   properties: {
     sidecarUrl: { type: "string", default: defaultConfig.sidecarUrl },
+    fallbackSidecarUrl: { type: "string", default: defaultConfig.fallbackSidecarUrl },
     timeoutMs: { type: "integer", default: defaultConfig.timeoutMs, minimum: 1 },
     failClosed: { type: "boolean", default: true },
     secret: { type: "string" },
@@ -51,6 +53,10 @@ function resolvePluginConfig(raw?: Record<string, unknown>): PluginConfig {
       typeof raw?.sidecarUrl === "string" && raw.sidecarUrl.trim()
         ? raw.sidecarUrl
         : defaultConfig.sidecarUrl,
+    fallbackSidecarUrl:
+      typeof raw?.fallbackSidecarUrl === "string" && raw.fallbackSidecarUrl.trim()
+        ? raw.fallbackSidecarUrl
+        : defaultConfig.fallbackSidecarUrl,
     timeoutMs:
       typeof raw?.timeoutMs === "number" && Number.isFinite(raw.timeoutMs) && raw.timeoutMs > 0
         ? Math.floor(raw.timeoutMs)

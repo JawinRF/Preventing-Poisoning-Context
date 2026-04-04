@@ -102,6 +102,7 @@ class OpenClawService : Service() {
                     "/v1/inspect" -> kotlinx.coroutines.runBlocking { svc.handleInspect(body) }
                     "/v1/guard" -> svc.handleGuard(body)
                     "/v1/status" -> kotlinx.coroutines.runBlocking { svc.handleStatus() }
+                    "/health" -> """{"status":"ok","sidecar":"android","port":$SIDECAR_PORT}"""
                     else -> """{"error":"unknown endpoint"}"""
                 }
                 return newFixedLengthResponse(Response.Status.OK, "application/json", responseJson)
@@ -169,6 +170,10 @@ class OpenClawService : Service() {
 
         updateNotification(finalVerdict)
 
+        val placeholderText = if (finalVerdict == "BLOCK") {
+            "[PRISM_BLOCKED untrusted context removed before model assembly]"
+        } else null
+
         // Response in Python sidecar-compatible schema
         return JSONObject().apply {
             put("verdict", finalVerdict)
@@ -176,11 +181,16 @@ class OpenClawService : Service() {
             put("reason", reason)
             put("layer_triggered", layerTriggered)
             put("normalized_text", norm.text.take(200))
-            put("ingestion_path", path)
-            put("score", l1.score)
-            put("l2_prob", l2Prob)
-            put("rules", l1.matchedRules.joinToString(","))
             put("ticket_id", JSONObject.NULL)
+            put("placeholder", placeholderText ?: JSONObject.NULL)
+            put("audit", JSONObject().apply {
+                put("path", path)
+                put("source_type", "android_sidecar")
+                put("score", l1.score)
+                put("l2_prob", l2Prob)
+                put("rules", l1.matchedRules.joinToString(","))
+            })
+            put("ingestion_path", path)
         }.toString()
     }
 
@@ -237,7 +247,6 @@ class OpenClawService : Service() {
                             matchedRules = l1.matchedRules.joinToString(",")
                         )
                     )
-                    (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).clearPrimaryClip()
                 }
             }
         }

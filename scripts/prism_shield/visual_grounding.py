@@ -194,16 +194,20 @@ DESCRIPTION: (brief description of what you see)
             verified = False
             confidence = 0.5
             description = answer
-            
+
             # Look for VERIFIED: yes/no
             verified_match = re.search(r"VERIFIED:\s*(yes|no)", answer, re.IGNORECASE)
             if verified_match:
                 verified = verified_match.group(1).lower() == "yes"
-            
-            # Look for CONFIDENCE: 0.X
-            conf_match = re.search(r"CONFIDENCE:\s*(0\.\d+|1\.0)", answer, re.IGNORECASE)
+
+            # Look for CONFIDENCE: 0.X (flexible — accept 0.85, .9, 1.0, etc.)
+            conf_match = re.search(r"CONFIDENCE:\s*(1\.0+|0?\.\d+)", answer, re.IGNORECASE)
             if conf_match:
                 confidence = float(conf_match.group(1))
+            elif verified:
+                # VLM confirmed element but didn't output parseable confidence;
+                # assign a reasonable default rather than blocking on 0.5
+                confidence = 0.85
             
             # Security: If VLM says not verified, BLOCK the action
             # This prevents XML-spoofing attacks

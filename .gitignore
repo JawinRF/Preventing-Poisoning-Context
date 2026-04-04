@@ -83,3 +83,8 @@ POC_PRESENTATION.md
 .codex
 
 DEMO_INSTRUCTIONS.md
+
+
+android/openclaw-prism/app/src/main/assets/www/
+android/openclaw-prism/www/dist/
+android/openclaw-prism/www/node_modules/

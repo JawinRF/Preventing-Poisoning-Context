@@ -8,6 +8,10 @@
         "type": "string",
         "default": "http://127.0.0.1:8765"
       },
+      "fallbackSidecarUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:8766"
+      },
       "timeoutMs": {
         "type": "integer",
         "default": 500,

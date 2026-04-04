@@ -2,6 +2,7 @@ import java.util.Properties
 
 plugins {
     alias(libs.plugins.androidApplication)
+    alias(libs.plugins.kotlinAndroid)
     alias(libs.plugins.detekt)
     alias(libs.plugins.ktlint)
     alias(libs.plugins.ksp)
@@ -9,7 +10,7 @@ plugins {
 
 android {
     namespace = "com.openclaw.android"
-    compileSdk = 36
+    compileSdk = 35
 
     dependenciesInfo {
         includeInApk = false
@@ -78,6 +79,10 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
     }
 
     @Suppress("UnstableApiUsage")

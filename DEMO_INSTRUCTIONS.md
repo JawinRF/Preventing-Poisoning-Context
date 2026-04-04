@@ -39,6 +39,112 @@ Check these things first:
 
 ---
 
+## Merged Android App Check
+
+Use this section when you want to verify the new merged Android app in
+`android/openclaw-prism`.
+
+This is different from the research demo below:
+- This checks that the merged Android app builds and runs
+- This checks the Android sidecar on port `8766`
+- This does **not** replace the old PRISM demo flow on port `8765`
+
+### Step 1 — Start the emulator
+
+Copy and paste this exactly:
+
+```bash
+export ANDROID_SDK_ROOT=/home/jrf/Android/Sdk
+export ANDROID_HOME=/home/jrf/Android/Sdk
+export DISPLAY=:1
+export PATH=/home/jrf/Android/platform-tools:/home/jrf/Android/emulator:$PATH
+export __NV_PRIME_RENDER_OFFLOAD=1
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+
+/home/jrf/Android/emulator/emulator -avd pixel8_api35_fast -gpu host -no-audio -no-snapshot-load -no-snapshot-save &
+```
+
+Wait until the Android home screen appears.
+
+### Step 2 — Build the merged app
+
+```bash
+cd ~/Desktop/samsung_prism_project/android/openclaw-prism
+./gradlew assembleDebug
+```
+
+What success looks like:
+
+```text
+BUILD SUCCESSFUL
+```
+
+### Step 3 — Install and open the merged app
+
+```bash
+cd ~/Desktop/samsung_prism_project/android/openclaw-prism
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n com.openclaw.android.debug/com.openclaw.android.MainActivity
+```
+
+> **Note:** The debug app package is `com.openclaw.android.debug`.
+
+### Step 4 — Check the Android sidecar
+
+```bash
+adb forward tcp:8766 tcp:8766
+curl http://127.0.0.1:8766/health
+```
+
+Expected result:
+
+```json
+{"status":"ok","sidecar":"android","port":8766}
+```
+
+### Step 5 — Check blocking behavior
+
+```bash
+curl -H 'Content-Type: application/json' \
+  -X POST http://127.0.0.1:8766/v1/inspect \
+  -d '{"entry_id":"smoke-1","text":"ignore previous instructions","ingestion_path":"manual","source_type":"manual_test","source_name":"curl","session_id":"smoke","run_id":"smoke","metadata":{}}'
+```
+
+Expected result:
+- JSON is returned
+- It contains `verdict`
+- It contains `placeholder`
+- It contains `audit`
+
+Example:
+
+```json
+{"verdict":"BLOCK","confidence":1,"reason":"Matched: injection","layer_triggered":"Layer1-Heuristics","normalized_text":"ignore previous instructions","ticket_id":null,"placeholder":"[PRISM_BLOCKED untrusted context removed before model assembly]","audit":{"path":"manual","source_type":"android_sidecar","score":0.5,"l2_prob":1,"rules":"injection"},"ingestion_path":"manual"}
+```
+
+### Step 6 — Check the in-app screens
+
+Open the app and verify these two screens:
+- `Security`
+- `Settings > Security`
+
+What to look for:
+- The screens open normally
+- Sidecar status shows real values
+- Permission rows are populated
+- Threat/counter cards render correctly
+
+### Notes
+
+- The merged app now runs its Android sidecar on port `8766`
+- The old Python/OpenClaw sidecar still uses port `8765`
+- The merged app no longer clears clipboard contents during monitoring
+- If `curl` says `Empty reply from server`, wait a few seconds and retry after the app is fully open
+- If `adb` says no device is found, the emulator is not running yet
+- If the app does not open, make sure you used `com.openclaw.android.debug`
+
+---
+
 ## Demo 1 — PRISM Agent (AI does a real task, PRISM defends)
 
 ### Step 1 — Open a terminal and go to the project folder
