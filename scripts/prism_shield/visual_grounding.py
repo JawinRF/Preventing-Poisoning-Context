@@ -1,19 +1,25 @@
 """
-visual_grounding.py
+visual_grounding.py  [OFFLINE AUDIT TOOL — not in the runtime tap path]
 -------------------
 Vision-Language Model based visual grounding for UI element verification.
 
-Security Critical: Malicious apps can use FLAG_SECURE, SurfaceView overlays,
-or invisible TextViews to completely blind or deceive the accessibility XML.
-This module verifies elements exist in actual pixels before any tap action executes.
+NOTE: This module is retained for OFFLINE auditing and debugging only.
+It is NOT used in the runtime agent tap path. The production tap-integrity
+check uses OS-level deterministic signals via the Android sidecar
+(/v1/ui-integrity in OpenClawService + UiIntegrityChecker).
 
-Uses the existing Moondream2 VLM (via llama-cpp-python) to:
+Research rationale for removal from critical path:
+  - ANDROIDWORLD (2024): text-only accessibility outperforms screenshot-VLM
+  - TapTrap (USENIX Security 2025): OS-level flags stop tapjacking, not VLM
+  - SeeClick/ScreenAI: even 5-10B specialized UI-vision models get ~53%
+    grounding accuracy; Moondream2 is far below that
+  - Android security guidance: filterTouchesWhenObscured,
+    FLAG_WINDOW_IS_PARTIALLY_OBSCURED are the platform-endorsed primitives
+
+Uses Moondream2 VLM (via llama-cpp-python) to:
 1. Verify a target element is visually present on screen
 2. Return confidence that the element is real (not spoofed)
 3. Provide visual coordinates if available
-
-This is the core defense against UI Obfuscation attacks that target
-the uiautomator2 XML dump that PRISM agents rely on.
 """
 
 from __future__ import annotations

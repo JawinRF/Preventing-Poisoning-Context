@@ -19,11 +19,18 @@ class PrismAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "PrismAccessibility"
+
+        /** Singleton reference for sidecar to query UI integrity checks. */
+        @Volatile
+        var instance: PrismAccessibilityService? = null
+            private set
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var classifier: OnnxClassifier? = null
     private lateinit var bridge: WindowContextBridge
+    lateinit var uiIntegrity: UiIntegrityChecker
+        private set
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -33,6 +40,10 @@ class PrismAccessibilityService : AccessibilityService() {
             AppLogger.w(TAG, "ONNX classifier unavailable: ${e.message}")
         }
         bridge = WindowContextBridge(this)
+        uiIntegrity = UiIntegrityChecker(this)
+        // Publish singleton AFTER all fields are initialized — prevents
+        // sidecar from hitting uninitialized uiIntegrity on early requests.
+        instance = this
 
         serviceInfo = serviceInfo.apply {
             eventTypes = AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
@@ -89,6 +100,7 @@ class PrismAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        instance = null
         scope.cancel()
         classifier?.close()
     }

@@ -18,6 +18,7 @@ import com.openclaw.android.security.MemShield
 import com.openclaw.android.security.Normalizer
 import com.openclaw.android.security.OnnxClassifier
 import com.openclaw.android.security.PiiGuard
+import com.openclaw.android.security.PrismAccessibilityService
 import com.openclaw.android.security.PrismDetector
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.CoroutineScope
@@ -33,9 +34,10 @@ import org.json.JSONObject
  * Terminal: START_STICKY keeps sessions alive when app is backgrounded.
  * PRISM: HTTP sidecar on :8766, clipboard monitoring, notification scan receiver.
  *
- *   POST /v1/inspect  — Layer 1+2 defense (heuristics + ONNX ML)
- *   POST /v1/guard    — PII Guard on outgoing agent actions
- *   GET  /v1/status   — Health check + blocked count
+ *   POST /v1/inspect        — Layer 1+2 defense (heuristics + ONNX ML)
+ *   POST /v1/guard          — PII Guard on outgoing agent actions
+ *   POST /v1/ui-integrity   — OS-level tap integrity check (replaces VLM visual grounding)
+ *   GET  /v1/status         — Health check + blocked count
  */
 class OpenClawService : Service() {
     companion object {
@@ -101,6 +103,7 @@ class OpenClawService : Service() {
                 val responseJson = when (uri) {
                     "/v1/inspect" -> kotlinx.coroutines.runBlocking { svc.handleInspect(body) }
                     "/v1/guard" -> svc.handleGuard(body)
+                    "/v1/ui-integrity" -> svc.handleUiIntegrity(body)
                     "/v1/status" -> kotlinx.coroutines.runBlocking { svc.handleStatus() }
                     "/health" -> """{"status":"ok","sidecar":"android","port":$SIDECAR_PORT}"""
                     else -> """{"error":"unknown endpoint"}"""
@@ -220,6 +223,23 @@ class OpenClawService : Service() {
             put("total_inspected", total)
             put("classifier_loaded", classifier != null)
         }.toString()
+    }
+
+    // POST /v1/ui-integrity — OS-level tap integrity check
+    private fun handleUiIntegrity(body: String): String {
+        val a11y = PrismAccessibilityService.instance
+            ?: return JSONObject().apply {
+                put("verdict", "ALLOW")
+                put("reason", "accessibility_service_unavailable")
+                put("checks", org.json.JSONArray())
+            }.toString()
+
+        val json = JSONObject(body)
+        val targetText = json.optString("target_text").ifEmpty { null }
+        val targetDesc = json.optString("target_desc").ifEmpty { null }
+        val expectedPkg = json.optString("expected_package").ifEmpty { null }
+
+        return a11y.uiIntegrity.check(targetText, targetDesc, expectedPkg).toString()
     }
 
     // ── Clipboard Hook ────────────────────────────────────────────────────────

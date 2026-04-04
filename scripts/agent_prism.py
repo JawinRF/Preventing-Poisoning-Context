@@ -849,7 +849,7 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
         # Record action + result for LLM context
         action_history.record(action, params, result)
 
-        if result == "blocked_by_prism" or result == "blocked_by_visual_grounding":
+        if result in ("blocked_by_prism", "blocked_by_visual_grounding", "blocked_by_ui_integrity"):
             print(f"  {BOLD}{RED}ACTION BLOCKED: {result}{RESET}")
             time.sleep(1.5)
             continue

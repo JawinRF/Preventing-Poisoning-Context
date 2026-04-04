@@ -499,7 +499,7 @@ def run(task, serial=SERIAL):
         print(f"  Result:  {result}")
         
         # If PRISM blocked the action, retry with a different approach
-        if result == "blocked_by_prism":
+        if result in ("blocked_by_prism", "blocked_by_ui_integrity"):
             print(f"  {BOLD}ACTION BLOCKED BY PRISM{RESET}")
             # Don't count as progress, let LLM know it was blocked on next iteration
             time.sleep(1.5)

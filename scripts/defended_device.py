@@ -4,33 +4,38 @@ defended_device.py — Wrapper around uiautomator2 device that enforces PRISM ch
 Agents use DefendedDevice instead of raw device + manual PRISM checks.
 This prevents defense logic duplication and ensures no action can bypass PRISM.
 
-Visual grounding (VLM-based XML-spoofing defense) runs synchronously before taps.
-Slow (~12s on CPU) but security-correct: blocks XML-spoofing before the tap lands.
+Tap integrity uses OS-level checks via the Android sidecar (/v1/ui-integrity):
+  - Foreground package verification
+  - Overlay / obscuration window detection
+  - Target node existence + bounds validity + interactability
+  - Dual-snapshot stability (node consistent across two rapid tree captures)
+
+Design rationale (research-backed, replaces prior VLM visual grounding):
+  - ANDROIDWORLD: accessibility tree outperforms screenshot-VLM for Android agents
+  - TapTrap (USENIX Security 2025): OS-level flags, not vision, stop tapjacking
+  - Android guidance: filterTouchesWhenObscured, FLAG_WINDOW_IS_PARTIALLY_OBSCURED
+  - SeeClick/ScreenAI: even specialized UI-vision models get ~53% grounding accuracy;
+    a tiny general VLM is not a defensible security boundary
 """
 from __future__ import annotations
 
+import json
 import logging
-import os
 import re
 import subprocess
 import time
-import uuid
-from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 if TYPE_CHECKING:
     from prism_client import PrismClient
 
 logger = logging.getLogger(__name__)
 
-# Try to import visual grounding module
-try:
-    from prism_shield.visual_grounding import visual_grounder, VisualGroundingResult
-    _VISUAL_GROUNDING_AVAILABLE = True
-except ImportError:
-    _VISUAL_GROUNDING_AVAILABLE = False
-    VisualGroundingResult = None
-
+# Android sidecar endpoint for UI integrity checks
+_SIDECAR_UI_INTEGRITY_URL = "http://127.0.0.1:8766/v1/ui-integrity"
+_SIDECAR_TIMEOUT_S = 3
 
 # Allowed packages — anything not on this list gets PRISM-checked
 ALLOWED_PACKAGES = {
@@ -74,85 +79,74 @@ class DefendedDevice:
         self._prism = prism
         self._serial = serial
         self._action_settle_time = action_settle_time
-        self._last_screenshot_path: str | None = None
-        
-        # Initialize visual grounding VLM
-        if _VISUAL_GROUNDING_AVAILABLE:
-            visual_grounder.initialize()
-            logger.info("Visual grounding VLM initialized in DefendedDevice")
-        else:
-            logger.warning("Visual grounding not available - XML spoofing attacks possible")
 
     @property
     def device(self):
         """Access the raw device for non-action calls (window_size, screen_on, etc.)."""
         return self._d
 
-    # ── Visual Grounding (XML-spoofing defense — synchronous blocking) ──────────
+    # ── UI Integrity (OS-level tap safety — replaces VLM visual grounding) ───
 
-    def _capture_screenshot(self) -> str | None:
-        """Capture current screen for visual grounding verification."""
-        try:
-            scripts_dir = Path(__file__).resolve().parent
-            temp_dir = scripts_dir.parent / "data" / "screenshots"
-            temp_dir.mkdir(parents=True, exist_ok=True)
+    def _verify_ui_integrity(
+        self,
+        target_text: str | None = None,
+        target_desc: str | None = None,
+        expected_package: str | None = None,
+    ) -> bool:
+        """Verify tap target via deterministic OS-level checks on the Android sidecar.
 
-            screenshot_path = temp_dir / f"vg_screen_{uuid.uuid4().hex[:8]}.png"
-            self._d.screenshot(str(screenshot_path))
-            self._last_screenshot_path = str(screenshot_path)
-            return str(screenshot_path)
-        except Exception as e:
-            logger.warning(f"Screenshot capture for visual grounding failed: {e}")
-            return None
+        Checks (all fast, <100ms total):
+          1. Foreground package matches expected target
+          2. No suspicious overlay / obscuration windows
+          3. Target node exists in accessibility tree with valid bounds
+          4. Node is enabled and visible
+          5. Node is stable across two rapid accessibility snapshots
 
-    def _verify_visual_grounding(self, target_text: str | None = None,
-                                  target_desc: str | None = None) -> bool:
-        """Verify the target element exists in actual screen pixels.
-
-        Synchronous and blocking — slow (~12s on CPU) but security-correct.
-        Blocks XML-spoofing attacks where malicious apps fake accessibility tree.
-
-        Returns True if verified or VLM unavailable, False if spoofing detected.
+        Returns True if all checks pass or sidecar unavailable, False if blocked.
         """
-        if not _VISUAL_GROUNDING_AVAILABLE:
-            logger.debug("Visual grounding unavailable (module not installed) — allowing tap")
+        payload = {}
+        if target_text:
+            payload["target_text"] = target_text
+        if target_desc:
+            payload["target_desc"] = target_desc
+        if expected_package:
+            payload["expected_package"] = expected_package
+
+        try:
+            req = Request(
+                _SIDECAR_UI_INTEGRITY_URL,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req, timeout=_SIDECAR_TIMEOUT_S) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+        except (URLError, OSError, json.JSONDecodeError) as e:
+            # Sidecar unavailable — allow tap (fail-open for availability,
+            # Layer 1-3 text pipeline remains the primary defense)
+            logger.warning(f"UI integrity sidecar unavailable: {e} — allowing tap")
             return True
 
-        if not visual_grounder._initialized or not visual_grounder.llm:
-            # Model failed to load or hasn't finished init — don't brick the agent
-            logger.warning("Visual grounding VLM not initialized — allowing tap")
-            return True
+        verdict = result.get("verdict", "ALLOW")
+        checks = result.get("checks", [])
 
-        screenshot_path = self._capture_screenshot()
-        if not screenshot_path:
-            logger.warning("Cannot capture screenshot for visual grounding — allowing tap")
-            return True
+        if verdict == "BLOCK":
+            failed = [c for c in checks if not c.get("pass", True)]
+            reasons = ", ".join(c.get("check", "?") for c in failed)
+            logger.warning(
+                f"UI INTEGRITY BLOCKED tap on '{target_text or target_desc}': "
+                f"failed checks: [{reasons}]"
+            )
+            for c in failed:
+                logger.debug(f"  check={c.get('check')}: {json.dumps(c)}")
+            return False
 
-        result = visual_grounder.verify_element(
-            screenshot_path=screenshot_path,
-            target_text=target_text,
-            target_desc=target_desc,
+        logger.debug(
+            f"UI integrity passed for '{target_text or target_desc}' "
+            f"({len(checks)} checks, pkg={result.get('foreground_package', '?')})"
         )
-
-        MIN_CONFIDENCE = 0.7
-        if result.confidence < MIN_CONFIDENCE:
-            logger.warning(
-                f"VISUAL GROUNDING LOW CONFIDENCE: {result.confidence:.2f} < {MIN_CONFIDENCE} "
-                f"for '{target_text or target_desc}' — blocking tap"
-            )
-            return False
-
-        if not result.verified:
-            logger.warning(
-                f"VISUAL GROUNDING BLOCKED: '{target_text or target_desc}' "
-                f"not found in screen pixels — possible XML spoofing! "
-                f"Reason: {result.reason}"
-            )
-            return False
-
-        logger.info(f"Visual grounding verified: {result.reason} (confidence: {result.confidence:.2f})")
         return True
-    
+
     # ── PRISM defense layer ──────────────────────────────────────────────────
 
     def _resolve_verdict(self, r) -> str | None:
@@ -247,10 +241,15 @@ class DefendedDevice:
                 target_text = params.get("text")
                 target_desc = params.get("desc")
 
-                # Synchronous VLM verification — blocks XML spoofing attacks
+                # OS-level UI integrity check (deterministic, <100ms)
                 if target_text or target_desc:
-                    if not self._verify_visual_grounding(target_text, target_desc):
-                        return "blocked_by_visual_grounding"
+                    # Snapshot foreground package so sidecar can verify it hasn't changed
+                    try:
+                        expected_pkg = self._d.app_current().get("package")
+                    except Exception:
+                        expected_pkg = None
+                    if not self._verify_ui_integrity(target_text, target_desc, expected_pkg):
+                        return "blocked_by_ui_integrity"
 
                 if "text" in params:
                     el = self._d(text=params["text"])

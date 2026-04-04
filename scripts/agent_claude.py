@@ -441,7 +441,7 @@ def run(task: str, serial: str = SERIAL, learn: bool = False):
         print(f"  Result:  {result}")
 
         # PRISM blocks trigger retry without history update
-        if result == "blocked_by_prism":
+        if result in ("blocked_by_prism", "blocked_by_ui_integrity"):
             print(f"  {YELLOW}Action blocked by PRISM - retrying{RESET}")
             time.sleep(BASE_WAIT)
             continue
