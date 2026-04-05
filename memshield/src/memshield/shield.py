@@ -458,14 +458,19 @@ class MemShield:
 
         filtered_docs, filtered_meta, filtered_ids = [], [], []
 
-        for batch_docs, batch_meta, batch_ids in zip(
+        raw_distances = raw.get("distances") or [[] for _ in raw["documents"]]
+
+        for batch_idx, (batch_docs, batch_meta, batch_ids) in enumerate(zip(
             raw["documents"], raw["metadatas"], raw["ids"]
-        ):
+        )):
+            batch_dists = raw_distances[batch_idx] if batch_idx < len(raw_distances) else []
+
             # ── Phase 1: per-chunk scan + provenance ─────────────────────
             phase1_docs, phase1_meta, phase1_ids = [], [], []
+            phase1_dists: list[float] = []
             tamper_flags: dict[str, float] = {}
 
-            for doc, meta, cid in zip(batch_docs, batch_meta or [], batch_ids):
+            for i, (doc, meta, cid) in enumerate(zip(batch_docs, batch_meta or [], batch_ids)):
 
                 # Provenance verification
                 if self.config.enable_provenance and not ContentHasher.verify(doc, meta):
@@ -498,6 +503,7 @@ class MemShield:
                     phase1_docs.append(doc)
                     phase1_meta.append(meta)
                     phase1_ids.append(cid)
+                    phase1_dists.append(batch_dists[i] if i < len(batch_dists) else 0.0)
                 elif result.verdict == "QUARANTINE":
                     self._quarantine_chunk(doc, cid, result)
                     logger.warning(f"QUARANTINED chunk {cid}: {result.reason}")
@@ -507,7 +513,8 @@ class MemShield:
             # ── Phase 2: retrieval defense (cross-document scoring) ──────
             if self.config.enable_retrieval_defense and phase1_docs and self._embedder:
                 scored = self._score_retrieval_set(
-                    query_text, phase1_docs, phase1_ids, phase1_meta, tamper_flags, session_id,
+                    query_text, phase1_docs, phase1_ids, phase1_meta,
+                    phase1_dists, tamper_flags, session_id,
                 )
                 clean_docs, clean_meta, clean_ids = [], [], []
                 for sd in scored:
@@ -549,6 +556,7 @@ class MemShield:
         docs: list[str],
         doc_ids: list[str],
         metadatas: list[dict],
+        distances: list[float],
         tamper_flags: dict[str, float],
         session_id: str,
     ) -> list:
@@ -562,6 +570,12 @@ class MemShield:
 
         k = len(docs)
         signals: list[SignalVector] = []
+
+        # Convert ChromaDB distances to relevance scores in [0, 1].
+        # ChromaDB returns L2 distances (lower = more relevant).
+        relevance_scores: dict[str, float] = {}
+        for did, dist in zip(doc_ids, distances):
+            relevance_scores[did] = 1.0 / (1.0 + dist) if dist else 1.0
 
         # ── Authority prior ──────────────────────────────────────────────
         # Bridge provenance metadata to authority scorer fields.
@@ -628,16 +642,21 @@ class MemShield:
             copy_map[did] = compute_copy_ratio(doc, query, other_docs)
 
         # ── Build signal vectors ─────────────────────────────────────────
+        # Normalize fragility (raw range ~1-15) to [0,1] via sigmoid centered at 5.
+        # Peakiness < 5 is normal; > 8 is suspicious.
+        def _norm_frag(raw: float) -> float:
+            return 1.0 / (1.0 + np.exp(-(raw - 5.0) / 2.0))
+
         for did in doc_ids:
             signals.append(SignalVector(
                 doc_id=did,
                 pgr=pgr_map.get(did, 0.0),
-                mask_fragility=frag_map.get(did, 0.0),
+                mask_fragility=_norm_frag(frag_map.get(did, 0.0)),
                 influence=influence_map.get(did, 0.0),
                 copy_ratio=copy_map.get(did, 0.0),
                 authority=auth_map.get(did, 0.5),
                 tamper=tamper_flags.get(did, 0.0),
-                original_score=1.0,  # ChromaDB doesn't expose relevance score directly
+                original_score=relevance_scores.get(did, 1.0),
             ))
 
         # ── Composite scoring + reranking ────────────────────────────────
