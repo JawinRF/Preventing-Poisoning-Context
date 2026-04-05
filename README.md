@@ -32,10 +32,13 @@ Action Decision → PRISM checks sensitive outgoing actions
 uiautomator2 executes on emulator
 ```
 
-**Two complementary layers:**
+**Three complementary defense layers:**
 
 - **PRISM Shield** (ingestion layer): Normalizer → Layer 1 Heuristics → Layer 2 TinyBERT → Layer 3 DeBERTa
-- **MemShield** (retrieval layer): Wraps ChromaDB to filter poisoned RAG chunks with audit logging
+- **MemShield** (RAG defense): Two-phase pipeline wrapping ChromaDB:
+  - *Ingest-time*: Normalization → regex → statistical anomaly → ML classifiers → SHA-256 provenance hashing
+  - *Retrieval-time*: Provenance verification → leave-one-out influence → RAGMask token fragility → authority prior → copy ratio → composite poison scorer σ(w·x) → reranking
+- **UI Integrity** (tap defense): OS-level checks via Android sidecar — foreground package verification, overlay detection, node validation, dual-snapshot stability
 
 ### Project structure
 
@@ -61,10 +64,26 @@ scripts/
     run_android_demo.sh       # Full emulator demo orchestration
 
 android/
-  prism-shield-service/       # On-device service (Compose dashboard, ONNX Layer 1+2)
+  openclaw-prism/             # Merged Android app (PRISM + OpenClaw runtime)
+    security/
+      PrismAccessibilityService.kt  # Accessibility service (Layer 1+2 on-device)
+      UiIntegrityChecker.kt         # OS-level tap safety (overlay, node, stability)
+      OnnxClassifier.kt             # On-device ONNX Layer 2
+    OpenClawService.kt        # NanoHTTPD sidecar (:8766, /v1/inspect, /v1/ui-integrity)
+  prism-shield-service/       # Legacy on-device service (Compose dashboard)
   poison-app/                 # Attack simulator (sends poisoned notifications)
 
-memshield/                    # Standalone MemShield Python package
+memshield/                    # MemShield RAG defense package (two-phase pipeline)
+  src/memshield/
+    shield.py                 # Core: ingest scan + retrieval defense orchestration
+    influence.py              # Leave-one-out influence scoring (semantic + citation drift)
+    ragmask.py                # RAGMask token-masking fragility
+    authority.py              # Authority prior (source trust, domain rep, entity corroboration)
+    progrank.py               # ProGRank perturbation instability
+    shadow.py                 # Shadow synthetic memory (TTL + corroboration)
+    scorer.py                 # Composite poison scorer + reranking + weight tuning
+    provenance.py             # SHA-256 content hashing + tamper detection
+    audit.py                  # JSONL audit logging
 data/                         # Synthetic dataset, audit logs, benchmarks
 models/                       # TinyBERT (FP32 + INT8), VLM
 ```
@@ -88,6 +107,12 @@ python scripts/agent_prism.py --task "Set alarm for 9 AM"
 
 # 5. Compare: undefended agent (PRISM bypassed)
 python scripts/agent_prism.py --task "Set alarm for 9 AM" --no-prism
+
+# 6. Run the MemShield RAG defense demo
+cd memshield && PYTHONPATH=src:../scripts python demo_memshield.py
+
+# 7. Run MemShield tests (37 tests covering full pipeline)
+cd memshield && PYTHONPATH=src:../scripts python -m pytest tests/ -v
 ```
 
 ### Port assignment
@@ -95,7 +120,7 @@ python scripts/agent_prism.py --task "Set alarm for 9 AM" --no-prism
 | Service | Port | Purpose |
 |---------|------|---------|
 | Python PRISM sidecar | 8765 | Agent's primary filter (Layer 1+2+3) |
-| Android PrismShieldService | 8766 | On-device dashboard, clipboard hooks |
+| Android sidecar (OpenClawService) | 8766 | On-device PRISM, UI integrity (`/v1/inspect`, `/v1/ui-integrity`) |
 | PrismNotificationListener | 8767 | Notifications, SMS, contacts, calendar (TCP via ADB forward) |
 
 ### Benchmark
