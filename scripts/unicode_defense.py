@@ -7,8 +7,6 @@ This copy lives under `scripts/` so it is importable when running:
     python scripts/your_script.py
 """
 
-from __future__ import annotations
-
 import re
 import unicodedata
 import random

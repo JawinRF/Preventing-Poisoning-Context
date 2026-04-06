@@ -3,8 +3,6 @@ Run the 8 prism_plus_memshield false-negative samples through
 ProtectAI/deberta-v3-base-prompt-injection-v2. Findings only; no pipeline integration.
 """
 
-from __future__ import annotations
-
 import json
 from pathlib import Path
 

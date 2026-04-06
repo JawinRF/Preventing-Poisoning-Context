@@ -2,7 +2,7 @@
 audit.py — EU AI Act Article 12 compliant audit logging for MemShield.
 """
 from __future__ import annotations
-import json, uuid
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass, asdict

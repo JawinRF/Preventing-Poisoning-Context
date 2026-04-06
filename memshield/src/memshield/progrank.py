@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import logging
 import random
-import re
 import string
 from dataclasses import dataclass, field
 from typing import Callable

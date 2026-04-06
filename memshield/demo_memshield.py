@@ -18,7 +18,7 @@ Two-phase defense:
     - Composite poison scorer: sigma(w . x) -> ALLOW / QUARANTINE / BLOCK
     - Reranking: (1 - poison_score) * relevance
 """
-import sys, os, base64
+import sys, os
 import numpy as np
 
 sys.path.insert(0, "src")
@@ -30,20 +30,20 @@ import chromadb
 from memshield import (
     MemShield, ShieldConfig,
     compute_influence, compute_fragility,
-    AuthorityScorer, AuthorityConfig,
-    PoisonScorer, ScorerWeights, SignalVector, compute_copy_ratio,
+    AuthorityScorer,
+    PoisonScorer, SignalVector, compute_copy_ratio,
 )
 
 
 # ── Detect available features ────────────────────────────────────────────────
 try:
-    from prism_shield.normalizer import Normalizer
+    import prism_shield.normalizer  # noqa: F401
     _HAS_NORMALIZER = True
 except ImportError:
     _HAS_NORMALIZER = False
 
 try:
-    from prism_shield.layer2_local_llm import LocalLLMValidator
+    import prism_shield.layer2_local_llm  # noqa: F401
     _HAS_ML = True
 except ImportError:
     _HAS_ML = False

@@ -18,14 +18,3 @@ class ValidationResult:
     layer_triggered: str  # "Layer1-Heuristics", "Layer2-LocalLLM", "Layer3-CloudLLM"
     normalized_text: Optional[str] = None
     ticket_id: Optional[str] = None
-
-
-@dataclass
-class FinalizedTicket:
-    ticket_id: str
-    status: str  # "PENDING", "ALLOW", "BLOCK"
-    confidence: float
-    reason: str
-    layer_triggered: str
-    created_at: str
-    resolved_at: Optional[str] = None

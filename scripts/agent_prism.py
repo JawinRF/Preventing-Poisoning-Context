@@ -12,7 +12,7 @@ Usage:
     python scripts/agent_prism.py --task "Add todo: Buy groceries" --llm claude
     python scripts/agent_prism.py --task "Set alarm" --no-prism   # bypass (for A/B test)
 """
-import argparse, hashlib, json, logging, os, re, subprocess, sys, time
+import argparse, hashlib, json, logging, os, sys, time
 import requests
 import uiautomator2 as u2
 

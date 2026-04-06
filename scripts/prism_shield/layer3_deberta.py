@@ -4,8 +4,6 @@ Layer 3: DeBERTa-based prompt injection classifier (ProtectAI/deberta-v3-base-pr
 Invoked only when Layer 2 returns ALLOW. Apache 2.0, no gating.
 """
 
-from __future__ import annotations
-
 import os
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline

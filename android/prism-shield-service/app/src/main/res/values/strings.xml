@@ -1,4 +1,0 @@
-<resources>
-    <string name="app_name">PRISM Shield</string>
-    <string name="accessibility_service_description">Scans screen content for prompt injection attacks before they reach the AI agent.</string>
-</resources>

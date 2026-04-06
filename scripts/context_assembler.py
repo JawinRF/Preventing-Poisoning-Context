@@ -1,22 +1,33 @@
 """
-context_assembler.py — Gathers active device context, filters each source
-through the PRISM Shield sidecar, and returns a clean AssembledContext that
-the agent LLM can safely consume.
+context_assembler.py — Gathers device context from the Android sidecar (:8766),
+filters each source through the PRISM Shield text sidecar (:8765), and returns
+a clean AssembledContext that the agent LLM can safely consume.
 
-Active sources today: UI accessibility, notifications, SMS, contacts,
-calendar, clipboard, intents, shared storage, and RAG retrieval.
-Network response monitoring is still a placeholder and is not part of the
-active runtime path.
+Architecture:
+  - Device context (notifications, clipboard, SMS, contacts, calendar) is read
+    via a single HTTP call to the on-device sidecar at :8766/v1/context.
+  - UI hierarchy is read via uiautomator2 (the only reliable host→device channel
+    for accessibility tree dumps).
+  - Shared storage files are read via ADB shell cat (explicit file paths only).
+  - RAG context is read via MemShield (Python-side ChromaDB).
+  - Every text item is filtered through PRISM :8765 before reaching the LLM.
 
-This is the core defense: PRISM sits BETWEEN Android-side sources and the LLM.
+This replaces the prior architecture that used 6 different transports (raw TCP
+sockets, adb shell service call, logcat parsing, etc.).
 """
 from __future__ import annotations
-import json, logging, re, socket, subprocess
+import json, logging, subprocess
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from urllib.error import URLError
+from urllib.request import Request, urlopen
+
 from prism_client import PrismClient
 
 logger = logging.getLogger(__name__)
+
+_ANDROID_SIDECAR_URL = "http://127.0.0.1:8766"
+_SIDECAR_TIMEOUT_S = 5
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -36,9 +47,8 @@ class AssembledContext:
     storage_data: list[dict] = field(default_factory=list)
     rag_context: list[str] = field(default_factory=list)
     blocked_counts: dict[str, int] = field(default_factory=dict)
-    degraded_paths: list[str] = field(default_factory=list)  # paths that failed to read
+    degraded_paths: list[str] = field(default_factory=list)
     audit_trail: list[dict] = field(default_factory=list)
-    screenshot_path: str | None = None  # Retained for audit/offline analysis only
 
     def to_prompt_dict(self) -> dict:
         """Build the dict that gets sent to the LLM."""
@@ -104,8 +114,8 @@ class Notification:
 
 class ContextAssembler:
     """
-    Gathers active device context, filters each source through the PRISM Shield
-    sidecar, and returns only clean data.
+    Gathers device context via the Android sidecar (:8766), filters each
+    source through PRISM (:8765), and returns only clean data.
     """
 
     def __init__(
@@ -121,35 +131,17 @@ class ContextAssembler:
         self.serial = serial
         self.memshield = memshield
         self.watched_paths = watched_paths or []
-        self._disable_host_clipboard_sync()
+        self._ensure_sidecar_forward()
 
-    def _disable_host_clipboard_sync(self) -> None:
-        """Disable host↔emulator clipboard sharing.
-
-        Android emulators sync the host clipboard bidirectionally by default.
-        This means host copy/paste leaks into the emulator clipboard and gets
-        picked up by _gather_clipboard, causing false reads of host-machine
-        content. We disable this via the emulator console command.
-        """
+    def _ensure_sidecar_forward(self) -> None:
+        """Set up ADB port forward so host can reach :8766 on the emulator."""
         try:
-            result = subprocess.run(
-                ["adb", "-s", self.serial, "emu", "clipboard", "sharing", "off"],
-                capture_output=True, text=True, timeout=3,
+            subprocess.run(
+                ["adb", "-s", self.serial, "forward", "tcp:8766", "tcp:8766"],
+                capture_output=True, timeout=5,
             )
-            if result.returncode == 0:
-                logger.info("Emulator clipboard sharing with host disabled")
-            else:
-                logger.warning(
-                    f"Could not disable clipboard sharing (rc={result.returncode}): "
-                    f"{result.stderr.strip() or result.stdout.strip()}. "
-                    "Host clipboard may leak into emulator context."
-                )
         except Exception as exc:
-            # Non-fatal — works on QEMU-based emulators, may fail on physical devices
-            logger.warning(
-                f"Could not disable clipboard sharing: {exc}. "
-                "Host clipboard may leak into emulator context."
-            )
+            logger.warning(f"ADB forward for :8766 failed: {exc}")
 
     def assemble(
         self,
@@ -167,72 +159,242 @@ class ContextAssembler:
         ctx = AssembledContext(task=task, step=step)
         self._agent_typed_texts = agent_typed_texts or set()
 
-        # 1. UI Accessibility (most critical path)
-        ctx.ui_elements, ui_blocked, _screenshot_path = self._gather_ui()
+        # 1. UI Accessibility (via uiautomator2 — the only reliable way)
+        ctx.ui_elements, ui_blocked = self._gather_ui()
         ctx.blocked_counts["ui_accessibility"] = ui_blocked
 
         # Compute screen signature for change detection
         current_sig = self._sig(ctx.ui_elements)
         ctx.screen_changed = current_sig != last_sig
 
-        # 2. Notifications
-        try:
-            ctx.notifications, notif_blocked = self._gather_notifications()
-            ctx.blocked_counts["notifications"] = notif_blocked
-        except Exception as e:
-            logger.warning(f"notifications ingestion failed: {e}")
-            ctx.blocked_counts["notifications"] = 0
-            ctx.degraded_paths.append("notifications")
+        # 2. Device context (notifications, clipboard, SMS, contacts, calendar)
+        #    Single HTTP call to the Android sidecar :8766/v1/context
+        device_ctx = self._fetch_device_context()
 
-        # 2b–2d. Socket-based paths (SMS, Contacts, Calendar)
-        # Track transport failures as degraded paths so the LLM knows
-        for name, gatherer, attr in [
-            ("sms", self._gather_sms, "sms_messages"),
-            ("contacts", self._gather_contacts, "contacts"),
-            ("calendar", self._gather_calendar, "calendar_events"),
-        ]:
-            try:
-                data, blocked = gatherer()
-                setattr(ctx, attr, data)
-                ctx.blocked_counts[name] = blocked
-            except Exception as e:
-                logger.warning(f"{name} ingestion failed: {e}")
-                ctx.blocked_counts[name] = 0
-                ctx.degraded_paths.append(name)
+        if device_ctx is not None:
+            ctx.notifications, n_blocked = self._filter_notifications(device_ctx)
+            ctx.blocked_counts["notifications"] = n_blocked
 
-        # 3. Clipboard
-        ctx.clipboard, clip_blocked = self._gather_clipboard()
-        ctx.blocked_counts["clipboard"] = clip_blocked
+            ctx.clipboard, clip_blocked = self._filter_clipboard(device_ctx)
+            ctx.blocked_counts["clipboard"] = clip_blocked
 
-        # 4. Android Intents
-        ctx.intent_data, intent_blocked = self._gather_intents()
-        ctx.blocked_counts["android_intents"] = intent_blocked
+            ctx.sms_messages, sms_blocked = self._filter_sms(device_ctx)
+            ctx.blocked_counts["sms"] = sms_blocked
 
-        # 5. Shared Storage
+            ctx.contacts, contacts_blocked = self._filter_contacts(device_ctx)
+            ctx.blocked_counts["contacts"] = contacts_blocked
+
+            ctx.calendar_events, cal_blocked = self._filter_calendar(device_ctx)
+            ctx.blocked_counts["calendar"] = cal_blocked
+        else:
+            # Sidecar unreachable — all device context paths degraded
+            for path in ("notifications", "clipboard", "sms", "contacts", "calendar"):
+                ctx.blocked_counts[path] = 0
+                ctx.degraded_paths.append(path)
+
+        # 3. Shared Storage (ADB file reads — explicit paths only)
         ctx.storage_data, stor_blocked = self._gather_storage()
         ctx.blocked_counts["shared_storage"] = stor_blocked
 
-        # 6. RAG Store
+        # 4. RAG Store
         ctx.rag_context, rag_blocked = self._gather_rag(rag_query or task, recent_actions)
         ctx.blocked_counts["rag_store"] = rag_blocked
 
         return ctx
 
+    # ── Device context (single HTTP call) ────────────────────────────────────
+
+    def _fetch_device_context(self) -> dict | None:
+        """Fetch all device context from the Android sidecar in one call.
+
+        Returns the parsed JSON dict, or None if the sidecar is unreachable.
+        Contains: notifications, clipboard, sms, contacts, calendar.
+        """
+        try:
+            req = Request(f"{_ANDROID_SIDECAR_URL}/v1/context", method="GET")
+            with urlopen(req, timeout=_SIDECAR_TIMEOUT_S) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (URLError, OSError, json.JSONDecodeError) as e:
+            logger.warning(f"Android sidecar :8766 unreachable: {e}")
+            return None
+
+    # ── Filter functions (consume from _fetch_device_context result) ──────────
+
+    def _filter_notifications(self, device_ctx: dict) -> tuple[list[dict], int]:
+        """Filter notifications from device context through PRISM."""
+        raw = device_ctx.get("notifications", [])
+        if not raw:
+            return [], 0
+
+        allowed = []
+        blocked = 0
+
+        for notif in raw:
+            text = f"{notif.get('title', '')} {notif.get('text', '')}".strip()
+            if not text:
+                continue
+
+            r = self.prism.inspect(
+                text=text,
+                ingestion_path="notifications",
+                source_type="notification",
+                source_name=notif.get("package", "unknown"),
+            )
+
+            if r.allowed:
+                allowed.append({
+                    "package": notif.get("package", "unknown"),
+                    "title": notif.get("title", ""),
+                    "text": notif.get("text", ""),
+                })
+            else:
+                blocked += 1
+                logger.warning(
+                    f"Notification BLOCKED: [{notif.get('package')}] '{text[:60]}'"
+                )
+
+        return allowed, blocked
+
+    def _filter_clipboard(self, device_ctx: dict) -> tuple[str | None, int]:
+        """Filter clipboard from device context through PRISM."""
+        clip_text = (device_ctx.get("clipboard") or "").strip()
+        if not clip_text:
+            return None, 0
+
+        # Skip agent's own typed text echoed into clipboard
+        if self._is_agent_text(clip_text):
+            logger.debug(f"Clipboard skipped (agent-typed text): {clip_text[:60]}")
+            return None, 0
+
+        r = self.prism.inspect(
+            text=clip_text,
+            ingestion_path="clipboard",
+            source_type="clipboard",
+            source_name="system_clipboard",
+        )
+
+        if r.allowed:
+            return clip_text, 0
+
+        logger.warning(f"Clipboard BLOCKED: '{clip_text[:60]}' — {r.reason}")
+        return None, 1
+
+    def _filter_sms(self, device_ctx: dict) -> tuple[list[dict], int]:
+        """Filter SMS from device context through PRISM."""
+        raw = device_ctx.get("sms", [])
+        if not raw:
+            return [], 0
+
+        allowed = []
+        blocked = 0
+
+        for msg in raw:
+            text = msg.get("body", "")
+            if not text:
+                continue
+
+            r = self.prism.inspect(
+                text=text,
+                ingestion_path="sms",
+                source_type="sms",
+                source_name=msg.get("address", "unknown"),
+            )
+
+            if r.allowed:
+                allowed.append({
+                    "id": msg.get("id"),
+                    "address": msg.get("address"),
+                    "body": text,
+                })
+            else:
+                blocked += 1
+                logger.warning(f"SMS BLOCKED: [{msg.get('address')}] '{text[:60]}'")
+
+        return allowed, blocked
+
+    def _filter_contacts(self, device_ctx: dict) -> tuple[list[dict], int]:
+        """Filter contacts from device context through PRISM."""
+        raw = device_ctx.get("contacts", [])
+        if not raw:
+            return [], 0
+
+        allowed = []
+        blocked = 0
+
+        for contact in raw:
+            note = contact.get("note", "")
+            if not note:
+                continue
+
+            r = self.prism.inspect(
+                text=note,
+                ingestion_path="contacts",
+                source_type="contact",
+                source_name=contact.get("name", "unknown"),
+            )
+
+            if r.allowed:
+                allowed.append({
+                    "id": contact.get("id"),
+                    "name": contact.get("name"),
+                    "note": note,
+                })
+            else:
+                blocked += 1
+                logger.warning(f"Contact note BLOCKED: [{contact.get('name')}] '{note[:60]}'")
+
+        return allowed, blocked
+
+    def _filter_calendar(self, device_ctx: dict) -> tuple[list[dict], int]:
+        """Filter calendar events from device context through PRISM."""
+        raw = device_ctx.get("calendar", [])
+        if not raw:
+            return [], 0
+
+        allowed = []
+        blocked = 0
+
+        for event in raw:
+            description = event.get("description", "")
+            title = event.get("title", "")
+            text = f"{title} {description}".strip()
+
+            if not text:
+                continue
+
+            r = self.prism.inspect(
+                text=text,
+                ingestion_path="calendar",
+                source_type="calendar_event",
+                source_name=event.get("id", "unknown"),
+            )
+
+            if r.allowed:
+                allowed.append({
+                    "id": event.get("id"),
+                    "title": title,
+                    "description": description,
+                })
+            else:
+                blocked += 1
+                logger.warning(f"Calendar event BLOCKED: [{title}] '{text[:60]}'")
+
+        return allowed, blocked
+
     # ── 1. UI Accessibility ──────────────────────────────────────────────────
 
-    def _gather_ui(self) -> tuple[list[dict], int, str | None]:
-        """Read screen dump, filter through PRISM, return clean elements."""
-        screenshot_path = None
+    def _gather_ui(self) -> tuple[list[dict], int]:
+        """Read screen dump via uiautomator2, filter through PRISM."""
         try:
             raw_xml = self.device.dump_hierarchy()
             root = ET.fromstring(raw_xml)
         except Exception as exc:
-            logger.warning(f"UI hierarchy dump failed (fail-closed, returning empty): {exc}")
-            return [], 0, screenshot_path
+            logger.warning(f"UI hierarchy dump failed: {exc}")
+            return [], 0
 
         elements = self._parse_ui_tree(root)
         if not elements:
-            return [], 0, screenshot_path
+            return [], 0
 
         # Fast path: concatenate all text, single PRISM check
         all_text = " ".join(
@@ -241,35 +403,28 @@ class ContextAssembler:
         )
 
         if not all_text.strip():
-            return elements[:30], 0, screenshot_path
+            return elements[:30], 0
 
         batch_result = self.prism.inspect(
             text=all_text,
             ingestion_path="ui_accessibility",
             source_type="accessibility",
             source_name="screen_dump",
-            metadata={},
         )
 
         if batch_result.allowed:
-            # Entire screen is clean — pass everything through
-            return elements[:30], 0, screenshot_path
+            return elements[:30], 0
 
-        # Slow path: screen flagged, filter per-element to find the poison
+        # Slow path: screen flagged, filter per-element
         allowed = []
         blocked_count = 0
 
         for elem in elements:
             elem_text = f"{elem.get('text', '')} {elem.get('desc', '')}".strip()
             if not elem_text:
-                # Structural elements (no text) are safe
                 allowed.append(elem)
                 continue
 
-            # Skip PRISM for:
-            # 1. Short UI labels (buttons, dates) — false positives in Layer 2/3
-            # 2. Input fields — contain agent's own typed text
-            # 3. Text that matches what the agent recently typed — not external
             if len(elem_text) <= 20 or elem.get("input_field"):
                 allowed.append(elem)
                 continue
@@ -283,14 +438,12 @@ class ContextAssembler:
                 ingestion_path="ui_accessibility",
                 source_type="accessibility",
                 source_name=elem.get("package", "unknown"),
-                metadata={},
             )
 
             if result.allowed:
                 allowed.append(elem)
             else:
                 blocked_count += 1
-                # Replace with safe placeholder so LLM knows something was here
                 allowed.append({
                     "class": elem.get("class", "View"),
                     "text": "[PRISM_FILTERED]",
@@ -299,10 +452,10 @@ class ContextAssembler:
                     f"UI element BLOCKED: '{elem_text[:60]}' — {result.reason}"
                 )
 
-        return allowed[:30], blocked_count, screenshot_path
+        return allowed[:30], blocked_count
 
     def _parse_ui_tree(self, root: ET.Element) -> list[dict]:
-        """Parse XML hierarchy into element dicts (reused from agent.py)."""
+        """Parse XML hierarchy into element dicts."""
         elems = []
         for node in root.iter():
             text = node.attrib.get("text", "").strip()
@@ -350,306 +503,7 @@ class ContextAssembler:
 
         return sorted_elems
 
-    # ── 2. Notifications ─────────────────────────────────────────────────────
-
-    _NOTIF_PORT = 8767  # Must match PrismNotificationListener.NOTIF_PORT
-
-    def _ensure_adb_forward(self):
-        """Set up ADB port forward to the device's TCP socket (idempotent)."""
-        try:
-            subprocess.run(
-                ["adb", "-s", self.serial, "forward",
-                 f"tcp:{self._NOTIF_PORT}", f"tcp:{self._NOTIF_PORT}"],
-                capture_output=True, timeout=3,
-            )
-        except Exception as e:
-            logger.warning(f"ADB forward setup failed: {e}")
-
-    def _gather_notifications(self) -> tuple[list[dict], int]:
-        """Read active notifications via native Android socket.
-
-        Returns empty list on socket failure (fail-open for non-security path).
-        """
-        notifications = self._gather_notifications_native()
-        if notifications is None:
-            raise OSError("Native notification socket unavailable")
-
-        if not notifications:
-            return [], 0
-
-        allowed = []
-        blocked = 0
-
-        for notif in notifications:
-            text = f"{notif.title} {notif.text}".strip()
-            if not text:
-                continue
-
-            r = self.prism.inspect(
-                text=text,
-                ingestion_path="notifications",
-                source_type="notification",
-                source_name=notif.package,
-            )
-
-            if r.allowed:
-                allowed.append({
-                    "package": notif.package,
-                    "title": notif.title,
-                    "text": notif.text,
-                })
-            else:
-                blocked += 1
-                logger.warning(
-                    f"Notification BLOCKED: [{notif.package}] '{text[:60]}'"
-                )
-
-        return allowed, blocked
-
-    def _gather_notifications_native(self) -> list[Notification] | None:
-        """Read notifications via native Android socket from PrismNotificationListener."""
-        try:
-            data = self._socket_request("list_notifications")
-            notifications = []
-            for n in data.get("notifications", []):
-                notifications.append(
-                    Notification(
-                        package=n.get("package", "unknown"),
-                        title=n.get("title", ""),
-                        text=n.get("text", "")
-                    )
-                )
-
-            logger.debug(f"Native notifications: {len(notifications)} received")
-            return notifications
-
-        except Exception as e:
-            logger.debug(f"Native notification socket unavailable: {e}")
-            return None
-
-    # ── 2b. SMS ───────────────────────────────────────────────────────────────
-
-    def _gather_sms(self) -> tuple[list[dict], int]:
-        """Read SMS messages via native Android socket."""
-        try:
-            data = self._socket_request("get_sms")
-            sms_list = data.get("sms", [])
-
-            if not sms_list:
-                return [], 0
-
-            allowed = []
-            blocked = 0
-
-            for msg in sms_list:
-                text = msg.get("body", "")
-                if not text:
-                    continue
-
-                r = self.prism.inspect(
-                    text=text,
-                    ingestion_path="sms",
-                    source_type="sms",
-                    source_name=msg.get("address", "unknown"),
-                )
-
-                if r.allowed:
-                    allowed.append({
-                        "id": msg.get("id"),
-                        "address": msg.get("address"),
-                        "body": text,
-                    })
-                else:
-                    blocked += 1
-                    logger.warning(f"SMS BLOCKED: [{msg.get('address')}] '{text[:60]}'")
-
-            return allowed, blocked
-
-        except Exception as e:
-            raise OSError(f"SMS socket unavailable: {e}") from e
-
-    # ── 2c. Contacts ──────────────────────────────────────────────────────────
-
-    def _gather_contacts(self) -> tuple[list[dict], int]:
-        """Read contacts with notes via native Android socket."""
-        try:
-            data = self._socket_request("get_contacts")
-            contacts_list = data.get("contacts", [])
-
-            if not contacts_list:
-                return [], 0
-
-            allowed = []
-            blocked = 0
-
-            for contact in contacts_list:
-                note = contact.get("note", "")
-                if not note:
-                    continue
-
-                r = self.prism.inspect(
-                    text=note,
-                    ingestion_path="contacts",
-                    source_type="contact",
-                    source_name=contact.get("name", "unknown"),
-                )
-
-                if r.allowed:
-                    allowed.append({
-                        "id": contact.get("id"),
-                        "name": contact.get("name"),
-                        "note": note,
-                    })
-                else:
-                    blocked += 1
-                    logger.warning(f"Contact note BLOCKED: [{contact.get('name')}] '{note[:60]}'")
-
-            return allowed, blocked
-
-        except Exception as e:
-            raise OSError(f"Contacts socket unavailable: {e}") from e
-
-    # ── 2d. Calendar ──────────────────────────────────────────────────────────
-
-    def _gather_calendar(self) -> tuple[list[dict], int]:
-        """Read calendar events via native Android socket."""
-        try:
-            data = self._socket_request("get_calendar")
-            events_list = data.get("calendar", [])
-
-            if not events_list:
-                return [], 0
-
-            allowed = []
-            blocked = 0
-
-            for event in events_list:
-                description = event.get("description", "")
-                title = event.get("title", "")
-                text = f"{title} {description}".strip()
-
-                if not text:
-                    continue
-
-                r = self.prism.inspect(
-                    text=text,
-                    ingestion_path="calendar",
-                    source_type="calendar_event",
-                    source_name=event.get("id", "unknown"),
-                )
-
-                if r.allowed:
-                    allowed.append({
-                        "id": event.get("id"),
-                        "title": title,
-                        "description": description,
-                    })
-                else:
-                    blocked += 1
-                    logger.warning(f"Calendar event BLOCKED: [{title}] '{text[:60]}'")
-
-            return allowed, blocked
-
-        except Exception as e:
-            raise OSError(f"Calendar socket unavailable: {e}") from e
-
-    # ── 3. Clipboard ─────────────────────────────────────────────────────────
-
-    def _gather_clipboard(self) -> tuple[str | None, int]:
-        """Read clipboard content from the emulator via ADB, filter through PRISM.
-
-        Skips content that matches agent-typed text (the agent's own typing
-        often echoes into the emulator clipboard via input-method side-effects).
-        """
-        try:
-            result = subprocess.run(
-                ["adb", "-s", self.serial, "shell",
-                 "service", "call", "clipboard", "2", "s16", "com.android.shell"],
-                capture_output=True, text=True, timeout=3,
-            )
-            clip_text = self._parse_service_call(result.stdout)
-        except Exception as exc:
-            logger.warning(f"Clipboard read failed (fail-closed, returning empty): {exc}")
-            return None, 0
-
-        if not clip_text:
-            return None, 0
-
-        # Skip if clip content is just the agent's own typed text echoed back
-        if self._is_agent_text(clip_text):
-            logger.debug(f"Clipboard skipped (agent-typed text): {clip_text[:60]}")
-            return None, 0
-
-        r = self.prism.inspect(
-            text=clip_text,
-            ingestion_path="clipboard",
-            source_type="clipboard",
-            source_name="system_clipboard",
-        )
-
-        if r.allowed:
-            return clip_text, 0
-
-        logger.warning(f"Clipboard BLOCKED: '{clip_text[:60]}' — {r.reason}")
-        return None, 1
-
-    @staticmethod
-    def _parse_service_call(output: str) -> str | None:
-        """Parse text from `service call clipboard` output."""
-        parts = re.findall(r"'([^']*)'", output)
-        text = "".join(parts).replace(".", "").strip()
-        return text if text and len(text) > 1 else None
-
-    # ── 4. Android Intents ───────────────────────────────────────────────────
-
-    def _gather_intents(self) -> tuple[list[dict], int]:
-        """Read recent intent broadcasts from logcat, filter through PRISM."""
-        try:
-            result = subprocess.run(
-                ["adb", "-s", self.serial, "shell",
-                 "logcat", "-d", "-s", "ActivityManager:I", "-t", "20"],
-                capture_output=True, text=True, timeout=3,
-            )
-        except Exception as exc:
-            logger.warning(f"Intent gathering failed (fail-closed, returning empty): {exc}")
-            return [], 0
-
-        intents = []
-        for line in result.stdout.split("\n"):
-            if "START" in line and "dat=" in line:
-                m = re.search(r"dat=(\S+)", line)
-                if m:
-                    intents.append({"type": "deep_link", "data": m.group(1)})
-
-        if not intents:
-            return [], 0
-
-        allowed = []
-        blocked = 0
-
-        for intent in intents:
-            r = self.prism.inspect(
-                text=intent["data"],
-                ingestion_path="android_intents",
-                source_type="intent",
-                source_name="activity_manager",
-            )
-            if r.allowed:
-                allowed.append(intent)
-            else:
-                blocked += 1
-
-        return allowed, blocked
-
-    # ── Network Responses (NOT IMPLEMENTED) ────────────────────────────────
-    # Would require a proxy or VPN-based traffic interceptor on the device.
-    # Not called from assemble() — kept as interface placeholder.
-
-    def _gather_network(self) -> tuple[list[dict], int]:
-        """Not implemented — no proxy/VPN interceptor available."""
-        return [], 0
-
-    # ── 5. Shared Storage ────────────────────────────────────────────────────
+    # ── Shared Storage (ADB file reads) ──────────────────────────────────────
 
     def _gather_storage(self) -> tuple[list[dict], int]:
         """Read watched files from device storage, filter through PRISM."""
@@ -667,7 +521,7 @@ class ContextAssembler:
                 )
                 content = result.stdout.strip()
             except Exception as exc:
-                logger.warning(f"Storage file read failed for {path} (fail-closed, skipping): {exc}")
+                logger.warning(f"Storage read failed for {path}: {exc}")
                 continue
 
             if not content:
@@ -688,7 +542,7 @@ class ContextAssembler:
 
         return allowed, blocked
 
-    # ── 7. RAG Store ─────────────────────────────────────────────────────────
+    # ── RAG Store ────────────────────────────────────────────────────────────
 
     def _gather_rag(
         self, query: str, recent_actions: list[dict] | None = None,
@@ -697,7 +551,6 @@ class ContextAssembler:
         if self.memshield is None:
             return [], 0
 
-        # Enrich query with recent successful actions for better retrieval
         enriched = query
         if recent_actions:
             action_context = " ".join(
@@ -720,39 +573,11 @@ class ContextAssembler:
             logger.warning(f"RAG query failed: {e}")
             return [], 0
 
-    # ── Socket helpers ────────────────────────────────────────────────────────
-
-    def _socket_request(self, action: str) -> dict:
-        """Send a JSON action to the device socket and read the full response.
-
-        Reads until the server closes the connection, so large payloads
-        (50 SMS, contacts, calendar events) are never truncated.
-        """
-        self._ensure_adb_forward()
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5)
-        try:
-            sock.connect(("127.0.0.1", self._NOTIF_PORT))
-            sock.sendall(json.dumps({"action": action}).encode() + b"\n")
-
-            chunks: list[bytes] = []
-            while True:
-                chunk = sock.recv(16384)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-
-            return json.loads(b"".join(chunks).decode("utf-8"))
-        finally:
-            sock.close()
-
     # ── Utilities ────────────────────────────────────────────────────────────
 
     def _is_agent_text(self, text: str) -> bool:
         """Check if text contains something the agent itself typed."""
         for typed in self._agent_typed_texts:
-            # The screen may show the typed text verbatim, truncated,
-            # or repeated (from previous failed attempts)
             if typed in text or text in typed:
                 return True
         return False

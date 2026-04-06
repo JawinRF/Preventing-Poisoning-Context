@@ -2,7 +2,6 @@
 
 from .base import BaseGenerator
 import random
-import xml.etree.ElementTree as ET
 
 class UIGenerator(BaseGenerator):
     def __init__(self):

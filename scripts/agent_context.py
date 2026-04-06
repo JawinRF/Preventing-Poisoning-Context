@@ -4,7 +4,7 @@ Simulates how a real mobile agent assembles context from the device.
 Notifications are read via ADB, then routed through PRISM before
 being added to the agent's context window.
 """
-import subprocess, requests, uuid, json, time, logging
+import subprocess, requests, uuid, logging
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)

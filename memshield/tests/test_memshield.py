@@ -10,8 +10,6 @@ Tests cover:
 import sys
 import os
 import time
-import tempfile
-import shutil
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -22,14 +20,13 @@ import chromadb
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from memshield import (
     MemShield, ShieldConfig,
-    compute_influence, InfluenceReport,
-    compute_fragility, FragilityReport,
+    compute_influence,
+    compute_fragility,
     AuthorityScorer, AuthorityConfig,
-    compute_instability, InstabilityReport,
-    ShadowMemory, ShadowEntry,
-    PoisonScorer, ScorerWeights, SignalVector, compute_copy_ratio,
+    compute_instability,
+    ShadowMemory,
+    PoisonScorer, SignalVector, compute_copy_ratio,
 )
-from memshield.provenance import ContentHasher
 
 
 # ── Shared test helpers ────────────────────────────────────────────────────────

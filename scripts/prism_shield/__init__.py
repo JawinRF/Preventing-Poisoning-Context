@@ -7,10 +7,9 @@ Android-style ingestion paths (clipboard, intents, notifications, UI
 accessibility dumps, etc.).
 """
 
-from .base import FinalizedTicket, MemoryEntry, ValidationResult
+from .base import MemoryEntry, ValidationResult
 
 __all__ = [
-    "FinalizedTicket",
     "MemoryEntry",
     "ValidationResult",
     "PrismShield",

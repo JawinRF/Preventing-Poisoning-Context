@@ -88,3 +88,4 @@ DEMO_INSTRUCTIONS.md
 android/openclaw-prism/app/src/main/assets/www/
 android/openclaw-prism/www/dist/
 android/openclaw-prism/www/node_modules/
+android/openclaw-prism/app/src/main/assets/tinybert_prism.onnx

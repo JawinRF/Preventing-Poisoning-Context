@@ -21,7 +21,7 @@ Retrieval-time defense pipeline (query → _filter_results → _score_retrieval_
 """
 from __future__ import annotations
 
-import re, uuid, sys, os, logging
+import uuid, sys, os, logging
 from dataclasses import dataclass
 from typing import Any, Callable
 from pathlib import Path
@@ -34,7 +34,7 @@ from .progrank import compute_instability
 from .scorer import PoisonScorer, ScorerWeights, SignalVector, compute_copy_ratio
 from .config import (
     _INJECTION_PATTERNS, _SUSPICIOUS_PATTERNS,
-    ShieldConfig, FailurePolicy,
+    ShieldConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -566,8 +566,6 @@ class MemShield:
         poison scorer. Returns ScoredDocuments in reranked order.
         """
         import numpy as np
-        from .scorer import ScoredDocument
-
         k = len(docs)
         signals: list[SignalVector] = []
 

@@ -3,10 +3,9 @@ prism_client.py — Thin HTTP client for the PRISM Shield sidecar.
 Single point of contact for all PRISM Shield interactions.
 """
 from __future__ import annotations
-import hashlib, logging, os, time, uuid
+import hashlib, logging, os, uuid
 from collections import OrderedDict
 from dataclasses import dataclass
-from functools import lru_cache
 
 import requests
 

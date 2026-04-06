@@ -75,7 +75,6 @@ scripts/
   demo/
     run_full_demo.py          # End-to-end Python sidecar demo (7 active paths)
     run_demo.py               # Scenario-based sidecar test
-    run_android_demo.sh       # Full emulator demo orchestration
 
 android/
   openclaw-prism/             # Merged Android app (PRISM + OpenClaw runtime)
@@ -84,7 +83,6 @@ android/
       UiIntegrityChecker.kt         # OS-level tap safety (overlay, node, stability)
       OnnxClassifier.kt             # On-device ONNX Layer 2
     OpenClawService.kt        # NanoHTTPD sidecar (:8766, /v1/inspect, /v1/ui-integrity)
-  prism-shield-service/       # Legacy on-device service (Compose dashboard)
   poison-app/                 # Attack simulator (sends poisoned notifications)
 
 memshield/                    # MemShield RAG defense package (two-phase pipeline)
@@ -99,7 +97,7 @@ memshield/                    # MemShield RAG defense package (two-phase pipelin
     provenance.py             # SHA-256 content hashing + tamper detection
     audit.py                  # JSONL audit logging
 data/                         # Synthetic dataset, audit logs, benchmarks
-models/                       # TinyBERT / DeBERTa assets + offline audit VLM weights
+models/                       # TinyBERT / DeBERTa assets
 ```
 
 ### Quick start

@@ -4,7 +4,7 @@ Simple demo for the PRISM Shield ingestion pipeline.
 This script:
   - Loads a small subset of the PRISM synthetic dataset
   - Runs the PrismShield pipeline on examples from each ingestion path
-  - Prints the verdicts (ALLOW/BLOCK/QUARANTINE) and reasons
+  - Prints the final verdicts (ALLOW/BLOCK) and reasons
 
 Intended to illustrate how the pipeline protects a mobile agent from
 poisoned context across Android-specific channels.
@@ -98,4 +98,3 @@ def run_demo():
 
 if __name__ == "__main__":
     run_demo()
-

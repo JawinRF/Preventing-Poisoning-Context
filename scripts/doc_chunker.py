@@ -3,8 +3,6 @@ doc_chunker.py — Simple document chunking for RAG ingestion.
 Splits text files into semantically meaningful chunks for ChromaDB storage.
 Uses sentence boundaries for splitting large paragraphs (not raw character counts).
 """
-from __future__ import annotations
-
 import re
 from pathlib import Path
 

@@ -9,8 +9,6 @@ Gated model: log in and accept license first:
   Then open https://huggingface.co/meta-llama/Llama-Prompt-Guard-2-22M and accept the terms.
 """
 
-from __future__ import annotations
-
 import json
 import sys
 from pathlib import Path

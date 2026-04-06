@@ -10,7 +10,6 @@ The Android side serializes to JSON and writes to a Unix domain socket.
 The Python pipeline reads and deserializes it here.
 """
 
-from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional

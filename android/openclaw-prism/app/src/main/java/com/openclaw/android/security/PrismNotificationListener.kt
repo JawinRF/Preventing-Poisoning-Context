@@ -25,6 +25,11 @@ class PrismNotificationListener : NotificationListenerService() {
     companion object {
         private const val TAG = "PrismNotifListener"
         const val NOTIF_PORT = 8767
+
+        /** Singleton for OpenClawService to read notifications via HTTP sidecar. */
+        @Volatile
+        var instance: PrismNotificationListener? = null
+            private set
     }
 
     private val activeNotifications = CopyOnWriteArrayList<NotificationEntry>()
@@ -41,14 +46,22 @@ class PrismNotificationListener : NotificationListenerService() {
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         contentReader = ContentProviderReader(this)
         startSocketServer()
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        instance = null
         serverThread?.interrupt()
     }
+
+    /** Public accessor for OpenClawService sidecar to read current notifications. */
+    fun getActiveNotificationsList(): List<NotificationEntry> = activeNotifications.toList()
+
+    /** Public accessor for content provider reader. */
+    fun getContentReader(): ContentProviderReader = contentReader
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         if (sbn == null) return

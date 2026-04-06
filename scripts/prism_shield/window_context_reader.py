@@ -125,8 +125,3 @@ _reader = WindowContextReader()
 def start_reader():
     """Call once at service startup."""
     _reader.start()
-
-
-def get_current_context() -> ScreenContext:
-    """Call from A-MemGuard at inference time. Always returns instantly."""
-    return _reader.get_context()

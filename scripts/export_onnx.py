@@ -7,7 +7,7 @@ from transformers import AutoModelForSequenceClassification
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_dir", default="models/tinybert_poison_classifier_v2")
-parser.add_argument("--output",    default="android/prism-shield-service/app/src/main/assets/tinybert_prism.onnx")
+parser.add_argument("--output",    default="android/openclaw-prism/app/src/main/assets/tinybert_prism.onnx")
 parser.add_argument("--seq_len",   type=int, default=128)
 args = parser.parse_args()
 

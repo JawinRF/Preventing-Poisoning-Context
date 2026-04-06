@@ -91,7 +91,7 @@ class DefendedDevice:
     def _ensure_ui_integrity_forward(self) -> None:
         """Set up ADB port forward so host can reach the on-device sidecar on :8766.
 
-        The Android sidecar (OpenClawService / PrismShieldService) listens on
+        The Android sidecar (OpenClawService) listens on
         localhost:8766 *inside the emulator*. We need ``adb forward`` to bridge
         host:8766 → device:8766. This is idempotent — re-running is harmless.
         """

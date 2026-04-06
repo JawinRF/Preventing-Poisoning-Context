@@ -37,6 +37,7 @@ import org.json.JSONObject
  *   POST /v1/inspect        — Layer 1+2 defense (heuristics + ONNX ML)
  *   POST /v1/guard          — PII Guard on outgoing agent actions
  *   POST /v1/ui-integrity   — OS-level tap integrity check (replaces VLM visual grounding)
+ *   GET  /v1/context        — Unified device context (notifications, clipboard, SMS, contacts, calendar)
  *   GET  /v1/status         — Health check + blocked count
  */
 class OpenClawService : Service() {
@@ -104,6 +105,7 @@ class OpenClawService : Service() {
                     "/v1/inspect" -> kotlinx.coroutines.runBlocking { svc.handleInspect(body) }
                     "/v1/guard" -> svc.handleGuard(body)
                     "/v1/ui-integrity" -> svc.handleUiIntegrity(body)
+                    "/v1/context" -> svc.handleContext()
                     "/v1/status" -> kotlinx.coroutines.runBlocking { svc.handleStatus() }
                     "/health" -> """{"status":"ok","sidecar":"android","port":$SIDECAR_PORT}"""
                     else -> """{"error":"unknown endpoint"}"""
@@ -240,6 +242,79 @@ class OpenClawService : Service() {
         val expectedPkg = json.optString("expected_package").ifEmpty { null }
 
         return a11y.uiIntegrity.check(targetText, targetDesc, expectedPkg).toString()
+    }
+
+    // GET /v1/context — Unified device context for the Python agent
+    private fun handleContext(): String {
+        val result = JSONObject()
+
+        // Notifications — from PrismNotificationListener singleton
+        val notifArray = org.json.JSONArray()
+        PrismNotificationListener.instance?.getActiveNotificationsList()?.forEach { n ->
+            notifArray.put(JSONObject().apply {
+                put("id", n.id)
+                put("package", n.packageName)
+                put("title", n.title)
+                put("text", n.text)
+                put("posted_time", n.postedTime)
+            })
+        }
+        result.put("notifications", notifArray)
+
+        // Clipboard — read directly from system service
+        val clipText = try {
+            val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.primaryClip?.getItemAt(0)?.getText()?.toString() ?: ""
+        } catch (_: Exception) { "" }
+        result.put("clipboard", clipText)
+
+        // SMS, Contacts, Calendar — from ContentProviderReader
+        val reader = PrismNotificationListener.instance?.getContentReader()
+            ?: ContentProviderReader(this)
+
+        try {
+            val smsArray = org.json.JSONArray()
+            reader.getSmsMessages(limit = 20).forEach { m ->
+                smsArray.put(JSONObject().apply {
+                    put("id", m.id); put("address", m.address)
+                    put("body", m.body); put("date", m.date)
+                })
+            }
+            result.put("sms", smsArray)
+        } catch (e: Exception) {
+            result.put("sms", org.json.JSONArray())
+            result.put("sms_error", e.message ?: "unknown")
+        }
+
+        try {
+            val contactsArray = org.json.JSONArray()
+            reader.getContacts(limit = 20).forEach { c ->
+                contactsArray.put(JSONObject().apply {
+                    put("id", c.id); put("name", c.name); put("note", c.note)
+                })
+            }
+            result.put("contacts", contactsArray)
+        } catch (e: Exception) {
+            result.put("contacts", org.json.JSONArray())
+            result.put("contacts_error", e.message ?: "unknown")
+        }
+
+        try {
+            val calendarArray = org.json.JSONArray()
+            reader.getCalendarEvents(limit = 20).forEach { ev ->
+                calendarArray.put(JSONObject().apply {
+                    put("id", ev.id); put("title", ev.title)
+                    put("description", ev.description)
+                    put("start_time", ev.startTime); put("end_time", ev.endTime)
+                })
+            }
+            result.put("calendar", calendarArray)
+        } catch (e: Exception) {
+            result.put("calendar", org.json.JSONArray())
+            result.put("calendar_error", e.message ?: "unknown")
+        }
+
+        return result.toString()
     }
 
     // ── Clipboard Hook ────────────────────────────────────────────────────────

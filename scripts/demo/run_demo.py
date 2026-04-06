@@ -1,7 +1,5 @@
 import requests
-import json
 import time
-import os
 from typing import Dict, Any
 
 URL = "http://127.0.0.1:8765/v1/inspect"

@@ -3,19 +3,18 @@
 agent_claude.py — Android agent with Claude + PRISM Shield + MemShield integration
 Robust to emulator lag, handles poisoned context detection.
 """
-import argparse, hashlib, json, logging, os, re, time, subprocess, sys
+import argparse, hashlib, json, logging, os, time, sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import anthropic
-import requests
 import uiautomator2 as u2
 
 from defended_device import DefendedDevice
 
 # Add memshield to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "memshield" / "src"))
-from memshield import MemShield, ShieldConfig, FailurePolicy
+from memshield import MemShield, ShieldConfig
 
 # RAG imports (optional)
 try:

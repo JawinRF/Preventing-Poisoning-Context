@@ -14,8 +14,6 @@ VLM-based quarantine resolution was removed — the current architecture uses
 deterministic OS-level UI integrity checks (Android sidecar :8766) for tap
 safety, not synchronous VLM inference in the request path.
 """
-from __future__ import annotations
-
 from .base import MemoryEntry, ValidationResult
 from .normalizer import Normalizer
 from .layer1_heuristics import HeuristicsEngine

@@ -18,7 +18,7 @@ Usage:
     python scripts/demo/run_full_demo.py                    # sidecar scenarios only
     python scripts/demo/run_full_demo.py --with-emulator    # full agent demo (needs emulator)
 """
-import argparse, json, os, subprocess, sys, time
+import argparse, os, subprocess, sys, time
 
 # Ensure scripts/ is on the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -293,12 +293,6 @@ def ensure_android_sidecar():
     subprocess.run(
         ["adb", "-s", SERIAL, "shell", "am", "start", "-n",
          "com.openclaw.android/.MainActivity"],
-        capture_output=True,
-    )
-    # Also try the standalone prism-shield-service
-    subprocess.run(
-        ["adb", "-s", SERIAL, "shell", "am", "start", "-n",
-         "com.prismshield/.MainActivity"],
         capture_output=True,
     )
     time.sleep(3)
