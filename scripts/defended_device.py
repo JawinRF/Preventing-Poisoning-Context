@@ -79,6 +79,7 @@ class DefendedDevice:
         self._prism = prism
         self._serial = serial
         self._action_settle_time = action_settle_time
+        self._ensure_ui_integrity_forward()
 
     @property
     def device(self):
@@ -86,6 +87,38 @@ class DefendedDevice:
         return self._d
 
     # ── UI Integrity (OS-level tap safety — replaces VLM visual grounding) ───
+
+    def _ensure_ui_integrity_forward(self) -> None:
+        """Set up ADB port forward so host can reach the on-device sidecar on :8766.
+
+        The Android sidecar (OpenClawService / PrismShieldService) listens on
+        localhost:8766 *inside the emulator*. We need ``adb forward`` to bridge
+        host:8766 → device:8766. This is idempotent — re-running is harmless.
+        """
+        try:
+            subprocess.run(
+                ["adb", "-s", self._serial, "forward", "tcp:8766", "tcp:8766"],
+                timeout=5, capture_output=True, check=True,
+            )
+            logger.info("ADB forward tcp:8766 → device:8766 established")
+        except FileNotFoundError:
+            logger.warning("adb not found — UI integrity sidecar will be unreachable")
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"adb forward failed: {e.stderr.decode().strip()}")
+        except subprocess.TimeoutExpired:
+            logger.warning("adb forward timed out")
+
+        # Quick health probe — warn early if the Android service isn't running
+        try:
+            req = Request("http://127.0.0.1:8766/v1/status", method="GET")
+            with urlopen(req, timeout=2) as resp:
+                logger.info(f"UI integrity sidecar healthy: {resp.read().decode()[:80]}")
+        except Exception:
+            logger.warning(
+                "UI integrity sidecar not responding on :8766. "
+                "Ensure the PRISM Shield app/service is running on the emulator. "
+                "Tap safety checks will fail-open until the sidecar is available."
+            )
 
     def _verify_ui_integrity(
         self,
@@ -152,18 +185,13 @@ class DefendedDevice:
     def _resolve_verdict(self, r) -> str | None:
         """
         Handle ALLOW / BLOCK / QUARANTINE verdicts.
-        For QUARANTINE, polls the sidecar for VLM resolution.
+        QUARANTINE is treated as BLOCK (no VLM in the request path).
         Returns "blocked_by_prism" if blocked, None if allowed.
         """
         if r.allowed:
             return None
-        if r.verdict == "QUARANTINE" and r.ticket_id:
-            logger.info(f"QUARANTINE verdict (ticket={r.ticket_id}) — polling for VLM resolution...")
-            resolved = self._prism.poll_quarantine(r.ticket_id)
-            if resolved.allowed:
-                logger.info(f"Quarantine lifted: {resolved.reason}")
-                return None
-            logger.warning(f"Quarantine confirmed: {resolved.reason}")
+        if r.verdict == "QUARANTINE":
+            logger.warning(f"QUARANTINE→BLOCK: {r.reason}")
         return "blocked_by_prism"
 
     def _check_prism(self, action: str, params: dict) -> str | None:
@@ -188,7 +216,7 @@ class DefendedDevice:
                 if DANGEROUS_TYPE_PATTERNS.search(text_data):
                     logger.warning(f"BLOCKED typed text (dangerous pattern): {text_data[:60]}")
                     return "blocked_by_prism"
-                r = self._prism.inspect(text_data, "clipboard", "text_input")
+                r = self._prism.inspect(text_data, "agent_output", "text_input")
                 result = self._resolve_verdict(r)
                 if result:
                     return result

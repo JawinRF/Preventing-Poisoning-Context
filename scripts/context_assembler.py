@@ -1,17 +1,19 @@
 """
-context_assembler.py — Gathers context from 9 defended ingestion paths,
-filters each through the PRISM Shield sidecar, and returns a clean
-AssembledContext that the agent LLM can safely consume.
-(Network response monitoring is planned but not yet implemented.)
+context_assembler.py — Gathers active device context, filters each source
+through the PRISM Shield sidecar, and returns a clean AssembledContext that
+the agent LLM can safely consume.
 
-This is the core defense: PRISM sits BETWEEN the Android sources and the LLM.
+Active sources today: UI accessibility, notifications, SMS, contacts,
+calendar, clipboard, intents, shared storage, and RAG retrieval.
+Network response monitoring is still a placeholder and is not part of the
+active runtime path.
+
+This is the core defense: PRISM sits BETWEEN Android-side sources and the LLM.
 """
 from __future__ import annotations
-import json, logging, re, socket, subprocess, uuid
+import json, logging, re, socket, subprocess
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from pathlib import Path
-
 from prism_client import PrismClient
 
 logger = logging.getLogger(__name__)
@@ -36,7 +38,7 @@ class AssembledContext:
     blocked_counts: dict[str, int] = field(default_factory=dict)
     degraded_paths: list[str] = field(default_factory=list)  # paths that failed to read
     audit_trail: list[dict] = field(default_factory=list)
-    screenshot_path: str | None = None  # For VLM verification on QUARANTINE
+    screenshot_path: str | None = None  # Retained for audit/offline analysis only
 
     def to_prompt_dict(self) -> dict:
         """Build the dict that gets sent to the LLM."""
@@ -102,8 +104,8 @@ class Notification:
 
 class ContextAssembler:
     """
-    Gathers context from 9 defended ingestion paths, filters each
-    through the PRISM Shield sidecar, and returns only clean data.
+    Gathers active device context, filters each source through the PRISM Shield
+    sidecar, and returns only clean data.
     """
 
     def __init__(
@@ -119,6 +121,35 @@ class ContextAssembler:
         self.serial = serial
         self.memshield = memshield
         self.watched_paths = watched_paths or []
+        self._disable_host_clipboard_sync()
+
+    def _disable_host_clipboard_sync(self) -> None:
+        """Disable host↔emulator clipboard sharing.
+
+        Android emulators sync the host clipboard bidirectionally by default.
+        This means host copy/paste leaks into the emulator clipboard and gets
+        picked up by _gather_clipboard, causing false reads of host-machine
+        content. We disable this via the emulator console command.
+        """
+        try:
+            result = subprocess.run(
+                ["adb", "-s", self.serial, "emu", "clipboard", "sharing", "off"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0:
+                logger.info("Emulator clipboard sharing with host disabled")
+            else:
+                logger.warning(
+                    f"Could not disable clipboard sharing (rc={result.returncode}): "
+                    f"{result.stderr.strip() or result.stdout.strip()}. "
+                    "Host clipboard may leak into emulator context."
+                )
+        except Exception as exc:
+            # Non-fatal — works on QEMU-based emulators, may fail on physical devices
+            logger.warning(
+                f"Could not disable clipboard sharing: {exc}. "
+                "Host clipboard may leak into emulator context."
+            )
 
     def assemble(
         self,
@@ -137,9 +168,8 @@ class ContextAssembler:
         self._agent_typed_texts = agent_typed_texts or set()
 
         # 1. UI Accessibility (most critical path)
-        ctx.ui_elements, ui_blocked, screenshot_path = self._gather_ui()
+        ctx.ui_elements, ui_blocked, _screenshot_path = self._gather_ui()
         ctx.blocked_counts["ui_accessibility"] = ui_blocked
-        ctx.screenshot_path = screenshot_path  # Store for VLM to use
 
         # Compute screen signature for change detection
         current_sig = self._sig(ctx.ui_elements)
@@ -190,27 +220,9 @@ class ContextAssembler:
 
     # ── 1. UI Accessibility ──────────────────────────────────────────────────
 
-    def _capture_screenshot(self) -> str | None:
-        """Capture screenshot and save to temp file for VLM processing."""
-        try:
-            # Create temp directory for screenshots
-            scripts_dir = Path(__file__).resolve().parent
-            temp_dir = scripts_dir.parent / "data" / "screenshots"
-            temp_dir.mkdir(parents=True, exist_ok=True)
-            
-            screenshot_path = temp_dir / f"screen_{uuid.uuid4().hex[:8]}.png"
-            self.device.screenshot(str(screenshot_path))
-            logger.debug(f"Screenshot captured: {screenshot_path}")
-            return str(screenshot_path)
-        except Exception as e:
-            logger.warning(f"Screenshot capture failed: {e}")
-            return None
-
     def _gather_ui(self) -> tuple[list[dict], int, str | None]:
-        """Read screen dump, filter through PRISM, return clean elements + screenshot path."""
-        # Capture screenshot first (for VLM on QUARANTINE)
-        screenshot_path = self._capture_screenshot()
-        
+        """Read screen dump, filter through PRISM, return clean elements."""
+        screenshot_path = None
         try:
             raw_xml = self.device.dump_hierarchy()
             root = ET.fromstring(raw_xml)
@@ -236,7 +248,7 @@ class ContextAssembler:
             ingestion_path="ui_accessibility",
             source_type="accessibility",
             source_name="screen_dump",
-            metadata={"screenshot_path": screenshot_path} if screenshot_path else {},
+            metadata={},
         )
 
         if batch_result.allowed:
@@ -271,7 +283,7 @@ class ContextAssembler:
                 ingestion_path="ui_accessibility",
                 source_type="accessibility",
                 source_name=elem.get("package", "unknown"),
-                metadata={"screenshot_path": screenshot_path} if screenshot_path else {},
+                metadata={},
             )
 
             if result.allowed:
@@ -544,7 +556,11 @@ class ContextAssembler:
     # ── 3. Clipboard ─────────────────────────────────────────────────────────
 
     def _gather_clipboard(self) -> tuple[str | None, int]:
-        """Read clipboard content via ADB, filter through PRISM."""
+        """Read clipboard content from the emulator via ADB, filter through PRISM.
+
+        Skips content that matches agent-typed text (the agent's own typing
+        often echoes into the emulator clipboard via input-method side-effects).
+        """
         try:
             result = subprocess.run(
                 ["adb", "-s", self.serial, "shell",
@@ -557,6 +573,11 @@ class ContextAssembler:
             return None, 0
 
         if not clip_text:
+            return None, 0
+
+        # Skip if clip content is just the agent's own typed text echoed back
+        if self._is_agent_text(clip_text):
+            logger.debug(f"Clipboard skipped (agent-typed text): {clip_text[:60]}")
             return None, 0
 
         r = self.prism.inspect(

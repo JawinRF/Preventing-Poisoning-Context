@@ -8,7 +8,6 @@ import os
 import sys
 import time as _time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from dataclasses import asdict
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -42,16 +41,13 @@ if str(MEMSHIELD_SRC_DIR) not in sys.path:
 
 from openclaw_adapter.audit import log_audit
 from openclaw_adapter.models import InspectRequest, InspectResponse
-from openclaw_adapter.quarantine_store import load_ticket
 from openclaw_adapter.source_mapper import map_ingestion_path
 from memshield import FailurePolicy, MemShield, ShieldConfig
 from prism_shield import MemoryEntry, PrismShield
 from prism_shield.ui_extractor import UIExtractor
-from prism_shield.window_context_reader import get_current_context
 
 
 BLOCK_PLACEHOLDER = "[PRISM_BLOCKED untrusted context removed before model assembly]"
-QUARANTINE_PLACEHOLDER = "[PRISM_QUARANTINED suspicious context pending verification]"
 DEFAULT_HOST = os.getenv("PRISM_SIDECAR_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.getenv("PRISM_SIDECAR_PORT", "8765"))
 ENABLE_MEMSHIELD_RAG = os.getenv("PRISM_ENABLE_MEMSHIELD_RAG", "1").lower() not in {"0", "false", "no"}
@@ -157,12 +153,11 @@ def handle_inspect(request: InspectRequest) -> InspectResponse:
         if ingestion_path == "rag_store" and ENABLE_MEMSHIELD_RAG:
             verdict, confidence, reason, layer_triggered = _inspect_rag_store(entry_text)
             ticket_id = None
-            if verdict == "BLOCK":
-                placeholder = BLOCK_PLACEHOLDER
-            elif verdict == "QUARANTINE":
-                placeholder = QUARANTINE_PLACEHOLDER
-            else:
-                placeholder = None
+            # MemShield may return QUARANTINE — resolve to BLOCK (no VLM in path)
+            if verdict == "QUARANTINE":
+                verdict = "BLOCK"
+                reason = f"[rag quarantine→block] {reason}"
+            placeholder = BLOCK_PLACEHOLDER if verdict == "BLOCK" else None
             audit = _build_audit(request, ingestion_path, ticket_id)
             log_audit(
                 request.entry_id,
@@ -215,15 +210,8 @@ def handle_inspect(request: InspectRequest) -> InspectResponse:
             )
 
         placeholder = None
-        ticket_id = result.ticket_id
-        if result.verdict == "QUARANTINE":
-            placeholder = QUARANTINE_PLACEHOLDER
-            screenshot_path = request.metadata.get("screenshot_path") or request.metadata.get("screenshot")
-            screen_context = request.metadata.get("screen_context")
-            if not screen_context:
-                screen_context = get_current_context().to_dict()
-            pipeline.submit_quarantine(ticket_id, screenshot_path, screen_context)
-        elif result.verdict == "BLOCK":
+        ticket_id = None
+        if result.verdict == "BLOCK":
             placeholder = BLOCK_PLACEHOLDER
 
         audit = _build_audit(request, ingestion_path, ticket_id)
@@ -275,13 +263,6 @@ def handle_inspect(request: InspectRequest) -> InspectResponse:
         )
 
 
-def handle_get_ticket(ticket_id: str) -> dict:
-    ticket = load_ticket(ticket_id)
-    if ticket is None:
-        raise HTTPException(status_code=404, detail="ticket_not_found")
-    return asdict(ticket)
-
-
 def handle_inspect_batch(items: list[dict]) -> list[dict]:
     """Process multiple inspect requests sequentially.
 
@@ -324,10 +305,6 @@ if FASTAPI_AVAILABLE:
         results = handle_inspect_batch(body.get("items", []))
         return JSONResponse({"results": results})
 
-    @app.get("/v1/ticket/{ticket_id}", dependencies=[Depends(_require_secret)])
-    def get_ticket_route(ticket_id: str) -> JSONResponse:
-        return JSONResponse(handle_get_ticket(ticket_id))
-
     @app.get("/health")
     def health_route() -> dict[str, str]:
         return health()
@@ -359,12 +336,6 @@ class PrismRequestHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/health":
                 self._send_json(200, health())
-                return
-
-            if parsed.path.startswith("/v1/ticket/"):
-                _require_secret_value(self.headers.get("X-PRISM-Secret"))
-                ticket_id = parsed.path.rsplit("/", 1)[-1]
-                self._send_json(200, handle_get_ticket(ticket_id))
                 return
 
             self._send_json(404, {"detail": "not_found"})

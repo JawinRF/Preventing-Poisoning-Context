@@ -2,11 +2,17 @@
 """
 run_full_demo.py — End-to-end PRISM Shield demonstration.
 
-Shows how PRISM defends a mobile agent across 6 ingestion paths (network planned) by:
-1. Starting the Python sidecar (if not already running)
-2. Seeding poisoned data across multiple paths
-3. Running the defended agent
-4. Comparing defended vs undefended behavior
+Shows how PRISM defends a mobile agent across 7 ingestion paths by:
+1. Starting the Python sidecar on :8765 (if not already running)
+2. Sending benign and poisoned payloads across each path
+3. Verifying the 3-layer text pipeline (L1 heuristics → L2 local-LLM → L3 DeBERTa)
+   returns correct ALLOW/BLOCK verdicts (QUARANTINE is resolved to BLOCK internally)
+4. Optionally running a live emulator demo with a defended agent
+
+Architecture:
+  - :8765  Python sidecar — text-layer defense (L1-L3) + MemShield RAG scanning
+  - :8766  Android sidecar — on-device PRISM + OS-level UI integrity checks
+  All verdicts are final (ALLOW or BLOCK). QUARANTINE is never exposed to callers.
 
 Usage:
     python scripts/demo/run_full_demo.py                    # sidecar scenarios only
@@ -188,7 +194,7 @@ SCENARIOS = [
 
 def run_scenarios() -> dict:
     """Run all test scenarios against the sidecar."""
-    header("PRISM Shield — 6 Ingestion Paths (network planned)")
+    header("PRISM Shield — 7 Ingestion Paths")
 
     results = {"passed": 0, "failed": 0, "total": len(SCENARIOS)}
     path_stats = {}
@@ -260,9 +266,61 @@ def print_summary(data: dict):
 
 # ── Emulator Demo ────────────────────────────────────────────────────────────
 
+def ensure_android_sidecar():
+    """Set up ADB port forward and verify the on-device sidecar (:8766) is reachable."""
+    info("Setting up ADB forward tcp:8766 → device:8766...")
+    fwd = subprocess.run(
+        ["adb", "-s", SERIAL, "forward", "tcp:8766", "tcp:8766"],
+        capture_output=True, text=True,
+    )
+    if fwd.returncode == 0:
+        ok("ADB port forward established")
+    else:
+        fail(f"ADB forward failed: {fwd.stderr.strip()}")
+        return False
+
+    # Verify sidecar responds
+    try:
+        r = requests.get("http://127.0.0.1:8766/v1/status", timeout=3)
+        if r.status_code == 200:
+            ok("Android sidecar (:8766) is healthy")
+            return True
+    except Exception:
+        pass
+
+    # Try starting the PRISM Shield app
+    info("Sidecar not responding — launching PRISM Shield app...")
+    subprocess.run(
+        ["adb", "-s", SERIAL, "shell", "am", "start", "-n",
+         "com.openclaw.android/.MainActivity"],
+        capture_output=True,
+    )
+    # Also try the standalone prism-shield-service
+    subprocess.run(
+        ["adb", "-s", SERIAL, "shell", "am", "start", "-n",
+         "com.prismshield/.MainActivity"],
+        capture_output=True,
+    )
+    time.sleep(3)
+
+    try:
+        r = requests.get("http://127.0.0.1:8766/v1/status", timeout=3)
+        if r.status_code == 200:
+            ok("Android sidecar (:8766) is now healthy")
+            return True
+    except Exception:
+        pass
+
+    fail("Android sidecar (:8766) unreachable. Ensure PRISM Shield is running on the emulator.")
+    info("Tap safety checks will fail-open — text pipeline on :8765 still active.")
+    return False
+
+
 def run_emulator_demo():
     """Full emulator demo: seed poison, run agent, show defense."""
     header("Live Emulator Demo")
+
+    ensure_android_sidecar()
 
     info("Seeding poisoned notification via ADB...")
     poison = (

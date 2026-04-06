@@ -1,6 +1,20 @@
 ## Preventing Poisoned Context for Mobile Agents
 
-This repo implements a complete defense system against context poisoning attacks on LLM-driven mobile agents, covering 9 Android ingestion paths (network monitoring planned).
+This repo implements a defense system against context poisoning attacks on LLM-driven mobile agents, with 7 active ingestion paths plus RAG retrieval defense. A network-response interceptor is still planned and is not part of the active runtime.
+
+### Current status
+
+- The merged Android app at `android/openclaw-prism` is validated at a meaningful level:
+  build/install/launch work, `:8766/health` responds, `/v1/inspect` responds, and
+  the Security/Dashboard/Terminal tabs render on-device.
+- The active Python PRISM sidecar path on `:8765` is now text-only:
+  no synchronous Moondream/VLM runs in the request path.
+- `agent_prism.py` currently depends on both sidecars during a defended run:
+  `:8765` for ingestion filtering and `:8766` for UI integrity checks before taps.
+- Known runtime caveat:
+  some legitimate typed strings are still being falsely blocked by the text-defense
+  pipeline, and the defended agent demo should be treated as in-progress until that
+  policy tuning is fixed.
 
 ### Architecture
 
@@ -45,7 +59,7 @@ uiautomator2 executes on emulator
 ```
 scripts/
   agent_prism.py              # Defended agent (Groq or Claude + full PRISM filtering)
-  context_assembler.py        # Gathers 9 ingestion paths, filters through PRISM (network planned)
+  context_assembler.py        # Gathers active device context, filters through PRISM
   prism_client.py             # HTTP client for the PRISM sidecar
   agent.py                    # Original undefended agent (for A/B comparison)
   prism_shield/               # Defense pipeline
@@ -59,7 +73,7 @@ scripts/
     server.py                 # HTTP sidecar (/v1/inspect, /v1/inspect/batch)
     models.py                 # Request/response schemas
   demo/
-    run_full_demo.py          # End-to-end demo (9 paths, network planned)
+    run_full_demo.py          # End-to-end Python sidecar demo (7 active paths)
     run_demo.py               # Scenario-based sidecar test
     run_android_demo.sh       # Full emulator demo orchestration
 
@@ -85,7 +99,7 @@ memshield/                    # MemShield RAG defense package (two-phase pipelin
     provenance.py             # SHA-256 content hashing + tamper detection
     audit.py                  # JSONL audit logging
 data/                         # Synthetic dataset, audit logs, benchmarks
-models/                       # TinyBERT (FP32 + INT8), VLM
+models/                       # TinyBERT / DeBERTa assets + offline audit VLM weights
 ```
 
 ### Quick start
@@ -102,18 +116,41 @@ python scripts/train_tinybert.py
 # 3. Run the demo (no emulator needed)
 python scripts/demo/run_full_demo.py
 
-# 4. Run the defended agent (requires emulator + GROQ_API_KEY)
+# 4. Start the Python PRISM sidecar
+python scripts/openclaw_adapter/server.py
+
+# 5. Start the merged Android app / on-device sidecar (:8766)
+cd android/openclaw-prism
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n com.openclaw.android.debug/com.openclaw.android.MainActivity
+adb forward tcp:8766 tcp:8766
+cd ../..
+
+# 6. Run the defended agent (requires emulator + ANTHROPIC_API_KEY or GROQ_API_KEY)
+export PRISM_SIDECAR_URL=http://127.0.0.1:8765
 python scripts/agent_prism.py --task "Set alarm for 9 AM"
 
-# 5. Compare: undefended agent (PRISM bypassed)
+# 7. Compare: undefended agent (PRISM bypassed)
 python scripts/agent_prism.py --task "Set alarm for 9 AM" --no-prism
 
-# 6. Run the MemShield RAG defense demo
+# 8. Run the MemShield RAG defense demo
 cd memshield && PYTHONPATH=src:../scripts python demo_memshield.py
 
-# 7. Run MemShield tests (37 tests covering full pipeline)
+# 9. Run MemShield tests (37 tests covering full pipeline)
 cd memshield && PYTHONPATH=src:../scripts python -m pytest tests/ -v
 ```
+
+### Defended agent caveats
+
+- `agent_prism.py` uses the Python sidecar on `:8765` for context filtering and the
+  Android sidecar on `:8766` for `/v1/ui-integrity`.
+- If `:8766` is not reachable, tap integrity checks fail open for availability and a
+  warning is logged.
+- Notification/SMS/contacts/calendar ingestion may be degraded in some emulator
+  sessions if the relevant Android socket/listener path is unavailable.
+- Some defended-agent false positives are still being tuned; treat the Python
+  defended demo as in-progress rather than fully polished.
 
 ### Port assignment
 
@@ -130,7 +167,7 @@ python scripts/run_benchmark.py         # Per-path precision/recall/F1 + latency
 python scripts/run_redteam_mutations.py  # Robustness against obfuscation attacks
 ```
 
-### 9 defended ingestion paths (network monitoring planned)
+### Active ingestion paths
 
 | Path | Source | Capture Method |
 |------|--------|----------------|
@@ -144,4 +181,8 @@ python scripts/run_redteam_mutations.py  # Robustness against obfuscation attack
 | `shared_storage` | Files on device | `adb shell cat` watched paths |
 | `rag_store` | Vector DB retrieval | MemShield-wrapped ChromaDB |
 
-*`network_responses` (API responses via network proxy) is planned but not yet implemented.*
+### Planned path
+
+| Path | Source | Capture Method |
+|------|--------|----------------|
+| `network_responses` | API responses via proxy/VPN interceptor | Not yet implemented |

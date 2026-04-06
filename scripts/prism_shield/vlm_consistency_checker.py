@@ -1,12 +1,15 @@
 """
 vlm_consistency_checker.py
 --------------------------
-Phase 3 component: On-Device Vision-Language Model Consistency Checker.
-Runs exclusively on QUARANTINE decisions to verify the payload against
-the actual visual pixels of the screen.
+[OFFLINE AUDIT TOOL — not in the runtime pipeline]
 
-Uses Moondream2 (GGUF INT8) via llama-cpp-python to keep memory footprint
-under 2GB and latency low. This runs asynchronously off the hot path.
+Previously ran Moondream2 VLM on QUARANTINE decisions to verify payloads
+against screen pixels. Replaced in the runtime path by:
+  - Deterministic OS-level UI integrity checks (Android sidecar :8766)
+  - Direct QUARANTINE→BLOCK resolution in pipeline.py (no async VLM wait)
+
+Retained for offline auditing and research evaluation only.
+Not imported by pipeline.py or any runtime code path.
 """
 
 from __future__ import annotations
