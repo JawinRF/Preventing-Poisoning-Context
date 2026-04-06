@@ -22,12 +22,41 @@ from defended_device import DefendedDevice
 
 # MemShield RAG imports (optional — graceful degradation if chromadb missing)
 try:
+    import numpy as np
     import chromadb
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "memshield", "src"))
     from memshield import MemShield, ShieldConfig
     _RAG_AVAILABLE = True
 except ImportError:
     _RAG_AVAILABLE = False
+
+
+# ── MemShield embedder/generator helpers ─────────────────────────────────────
+# These bridge ChromaDB's default embedding function into MemShield's
+# retrieval-defense pipeline so ragmask/influence scoring uses the same
+# embedding space as the retrieval itself.
+
+def _make_chroma_embedder() -> "Callable[[str], np.ndarray] | None":
+    """Wrap ChromaDB's default embedding function for MemShield."""
+    if not _RAG_AVAILABLE:
+        return None
+    ef = chromadb.api.types.DefaultEmbeddingFunction()
+
+    def embedder(text: str) -> "np.ndarray":
+        return np.array(ef([text])[0], dtype=np.float32)
+
+    return embedder
+
+
+def _concat_generator(query: str, documents: list[str]) -> str:
+    """Lightweight deterministic generator for influence scoring.
+
+    Influence scoring measures how much removing a document changes the
+    generated output.  A concatenation-based generator is sufficient —
+    the semantic-drift component (cosine distance between outputs)
+    dominates, so we don't need an actual LLM here.
+    """
+    return f"{query} | {' '.join(documents)}"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -621,7 +650,17 @@ _SEED_DOCS = [
 
 
 def _setup_rag(enable_prism: bool) -> "MemShield | None":
-    """Create a persistent RAG knowledge base with MemShield defense."""
+    """Create a persistent RAG knowledge base with MemShield defense.
+
+    When PRISM is enabled, the full retrieval-defense pipeline is active:
+      provenance → influence → ragmask → authority → copy → scorer → rerank
+
+    The embedder wraps ChromaDB's default all-MiniLM-L6-v2 so ragmask and
+    influence scoring use the same embedding space as retrieval.
+
+    ProGRank (perturbation instability) is gated behind PRISM_ENABLE_PROGRANK=1
+    because it re-queries ChromaDB N times per retrieval.
+    """
     if not _RAG_AVAILABLE:
         return None
     try:
@@ -629,16 +668,20 @@ def _setup_rag(enable_prism: bool) -> "MemShield | None":
         client = chromadb.PersistentClient(path=db_path)
         collection = client.get_or_create_collection("agent_kb")
 
-        # Agents use regex + provenance only for local RAG scanning.
-        # ML-grade scanning (TinyBERT/DeBERTa) runs in the sidecar to avoid
-        # duplicating ~1GB of models per process.
+        embedder = _make_chroma_embedder() if enable_prism else None
+        progrank = os.getenv("PRISM_ENABLE_PROGRANK", "0").lower() in ("1", "true", "yes")
+
         shield = MemShield(
             collection=collection,
             config=ShieldConfig(
                 enable_normalization=enable_prism,
-                enable_ml_layers=False,
+                enable_ml_layers=False,  # ML runs in the sidecar, not in-process
                 enable_provenance=True,
+                enable_retrieval_defense=enable_prism,
+                enable_progrank=progrank,
             ),
+            embedder=embedder,
+            generator=_concat_generator if enable_prism else None,
         )
 
         # Seed only on first run (persistent DB survives restarts).
@@ -744,7 +787,11 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
     memshield = _setup_rag(enable_prism)
     if memshield:
         kb_count = memshield.collection.count() if memshield.collection else 0
-        print(f"  RAG: {CYAN}ACTIVE{RESET} ({kb_count} docs, persistent, regex+provenance; ML via sidecar)")
+        if enable_prism:
+            progrank_flag = "progrank ON" if memshield.config.enable_progrank else "progrank OFF"
+            print(f"  RAG: {CYAN}ACTIVE{RESET} ({kb_count} docs, retrieval defense ON, {progrank_flag})")
+        else:
+            print(f"  RAG: {CYAN}ACTIVE{RESET} ({kb_count} docs, defense OFF)")
         if learn:
             print(f"  Learn: {CYAN}ON{RESET} (successful sequences saved to KB)")
     else:

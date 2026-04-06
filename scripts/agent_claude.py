@@ -71,24 +71,30 @@ _SEED_DOCS = [
 
 
 def _setup_rag() -> "MemShield | None":
-    """Create persistent RAG knowledge base with MemShield defense."""
+    """Create persistent RAG knowledge base with MemShield retrieval defense."""
     if not _RAG_AVAILABLE or not ENABLE_MEMSHIELD:
         return None
     try:
+        # Import helpers from agent_prism (shared RAG setup logic)
+        from agent_prism import _make_chroma_embedder, _concat_generator
+
         db_path = os.path.join(os.path.dirname(__file__), "..", "data", "chromadb")
         client = chromadb.PersistentClient(path=db_path)
         collection = client.get_or_create_collection("agent_kb")
 
-        # Agents use regex + provenance only for local RAG scanning.
-        # ML-grade scanning (TinyBERT/DeBERTa) runs in the sidecar to avoid
-        # duplicating ~1GB of models per process.
+        progrank = os.getenv("PRISM_ENABLE_PROGRANK", "0").lower() in ("1", "true", "yes")
+
         shield = MemShield(
             collection=collection,
             config=ShieldConfig(
                 enable_normalization=True,
-                enable_ml_layers=False,
+                enable_ml_layers=False,  # ML runs in the sidecar, not in-process
                 enable_provenance=True,
+                enable_retrieval_defense=True,
+                enable_progrank=progrank,
             ),
+            embedder=_make_chroma_embedder(),
+            generator=_concat_generator,
         )
 
         if collection.count() == 0:

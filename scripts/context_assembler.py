@@ -172,20 +172,23 @@ class ContextAssembler:
         device_ctx = self._fetch_device_context()
 
         if device_ctx is not None:
-            ctx.notifications, n_blocked = self._filter_notifications(device_ctx)
-            ctx.blocked_counts["notifications"] = n_blocked
-
-            ctx.clipboard, clip_blocked = self._filter_clipboard(device_ctx)
-            ctx.blocked_counts["clipboard"] = clip_blocked
-
-            ctx.sms_messages, sms_blocked = self._filter_sms(device_ctx)
-            ctx.blocked_counts["sms"] = sms_blocked
-
-            ctx.contacts, contacts_blocked = self._filter_contacts(device_ctx)
-            ctx.blocked_counts["contacts"] = contacts_blocked
-
-            ctx.calendar_events, cal_blocked = self._filter_calendar(device_ctx)
-            ctx.blocked_counts["calendar"] = cal_blocked
+            # Each filter checks its *_error field and marks degraded if present
+            for name, attr, filter_fn in [
+                ("notifications", "notifications",   self._filter_notifications),
+                ("clipboard",     "clipboard",       self._filter_clipboard),
+                ("sms",           "sms_messages",    self._filter_sms),
+                ("contacts",      "contacts",        self._filter_contacts),
+                ("calendar",      "calendar_events", self._filter_calendar),
+            ]:
+                error_key = f"{name}_error"
+                if error_key in device_ctx:
+                    logger.warning(f"{name} unavailable on device: {device_ctx[error_key]}")
+                    ctx.blocked_counts[name] = 0
+                    ctx.degraded_paths.append(name)
+                else:
+                    data, blocked = filter_fn(device_ctx)
+                    setattr(ctx, attr, data)
+                    ctx.blocked_counts[name] = blocked
         else:
             # Sidecar unreachable — all device context paths degraded
             for path in ("notifications", "clipboard", "sms", "contacts", "calendar"):

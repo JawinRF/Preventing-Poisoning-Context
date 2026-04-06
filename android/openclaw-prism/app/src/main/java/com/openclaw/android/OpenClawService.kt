@@ -249,17 +249,23 @@ class OpenClawService : Service() {
         val result = JSONObject()
 
         // Notifications — from PrismNotificationListener singleton
-        val notifArray = org.json.JSONArray()
-        PrismNotificationListener.instance?.getActiveNotificationsList()?.forEach { n ->
-            notifArray.put(JSONObject().apply {
-                put("id", n.id)
-                put("package", n.packageName)
-                put("title", n.title)
-                put("text", n.text)
-                put("posted_time", n.postedTime)
-            })
+        val listener = PrismNotificationListener.instance
+        if (listener != null) {
+            val notifArray = org.json.JSONArray()
+            listener.getActiveNotificationsList().forEach { n ->
+                notifArray.put(JSONObject().apply {
+                    put("id", n.id)
+                    put("package", n.packageName)
+                    put("title", n.title)
+                    put("text", n.text)
+                    put("posted_time", n.postedTime)
+                })
+            }
+            result.put("notifications", notifArray)
+        } else {
+            result.put("notifications", org.json.JSONArray())
+            result.put("notifications_error", "NotificationListenerService not active")
         }
-        result.put("notifications", notifArray)
 
         // Clipboard — read directly from system service
         val clipText = try {
