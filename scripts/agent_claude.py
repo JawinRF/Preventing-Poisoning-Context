@@ -71,37 +71,49 @@ _SEED_DOCS = [
 
 
 def _setup_rag() -> "MemShield | None":
-    """Create persistent RAG knowledge base with MemShield retrieval defense."""
+    """Create persistent RAG knowledge base with MemShield defense.
+
+    Mode controlled by env vars (same as agent_prism):
+      PRISM_ENABLE_RETRIEVAL_DEFENSE=0 (default) — lightweight
+      PRISM_ENABLE_RETRIEVAL_DEFENSE=1 — full retrieval-defense pipeline
+      PRISM_ENABLE_PROGRANK=1 — adds perturbation instability (expensive)
+    """
     if not _RAG_AVAILABLE or not ENABLE_MEMSHIELD:
         return None
     try:
-        # Import helpers from agent_prism (shared RAG setup logic)
         from agent_prism import _make_chroma_embedder, _concat_generator
 
         db_path = os.path.join(os.path.dirname(__file__), "..", "data", "chromadb")
         client = chromadb.PersistentClient(path=db_path)
         collection = client.get_or_create_collection("agent_kb")
 
-        progrank = os.getenv("PRISM_ENABLE_PROGRANK", "0").lower() in ("1", "true", "yes")
+        retrieval_defense = os.getenv("PRISM_ENABLE_RETRIEVAL_DEFENSE", "0").lower() in ("1", "true", "yes")
+        progrank = (
+            retrieval_defense
+            and os.getenv("PRISM_ENABLE_PROGRANK", "0").lower() in ("1", "true", "yes")
+        )
 
         shield = MemShield(
             collection=collection,
             config=ShieldConfig(
                 enable_normalization=True,
-                enable_ml_layers=False,  # ML runs in the sidecar, not in-process
+                enable_ml_layers=False,
                 enable_provenance=True,
-                enable_retrieval_defense=True,
+                enable_retrieval_defense=retrieval_defense,
                 enable_progrank=progrank,
             ),
-            embedder=_make_chroma_embedder(),
-            generator=_concat_generator,
+            embedder=_make_chroma_embedder() if retrieval_defense else None,
+            generator=_concat_generator if retrieval_defense else None,
         )
 
         if collection.count() == 0:
             ids = [f"kb_{i}" for i in range(len(_SEED_DOCS))]
             shield.add_with_provenance(documents=_SEED_DOCS, ids=ids)
 
-        logger.info(f"RAG knowledge base: {collection.count()} documents (persistent)")
+        mode = "lightweight"
+        if retrieval_defense:
+            mode = "full retrieval defense" + (" + progrank" if progrank else "")
+        logger.info(f"RAG knowledge base: {collection.count()} docs, mode={mode}")
         return shield
     except Exception as e:
         logger.warning(f"RAG setup failed: {e}")
@@ -362,7 +374,11 @@ def run(task: str, serial: str = SERIAL, learn: bool = False):
     memshield = _setup_rag()
     if memshield:
         kb_count = memshield.collection.count() if memshield.collection else 0
-        print(f"  RAG: {CYAN}ACTIVE{RESET} ({kb_count} docs, persistent, regex+provenance; ML via sidecar)")
+        if memshield.config.enable_retrieval_defense:
+            progrank_flag = "progrank ON" if memshield.config.enable_progrank else "progrank OFF"
+            print(f"  RAG: {CYAN}ACTIVE{RESET} ({kb_count} docs, full retrieval defense, {progrank_flag})")
+        else:
+            print(f"  RAG: {CYAN}ACTIVE{RESET} ({kb_count} docs, lightweight — provenance + regex)")
         if learn:
             print(f"  Learn: {CYAN}ON{RESET} (successful sequences saved to KB)")
     else:

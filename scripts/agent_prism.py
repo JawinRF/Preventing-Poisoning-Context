@@ -33,8 +33,8 @@ except ImportError:
 
 # ── MemShield embedder/generator helpers ─────────────────────────────────────
 # These bridge ChromaDB's default embedding function into MemShield's
-# retrieval-defense pipeline so ragmask/influence scoring uses the same
-# embedding space as the retrieval itself.
+# retrieval-defense pipeline (used when PRISM_ENABLE_RETRIEVAL_DEFENSE=1)
+# so ragmask/influence scoring uses the same embedding space as retrieval.
 
 def _make_chroma_embedder() -> "Callable[[str], np.ndarray] | None":
     """Wrap ChromaDB's default embedding function for MemShield."""
@@ -652,14 +652,14 @@ _SEED_DOCS = [
 def _setup_rag(enable_prism: bool) -> "MemShield | None":
     """Create a persistent RAG knowledge base with MemShield defense.
 
-    When PRISM is enabled, the full retrieval-defense pipeline is active:
-      provenance → influence → ragmask → authority → copy → scorer → rerank
-
-    The embedder wraps ChromaDB's default all-MiniLM-L6-v2 so ragmask and
-    influence scoring use the same embedding space as retrieval.
-
-    ProGRank (perturbation instability) is gated behind PRISM_ENABLE_PROGRANK=1
-    because it re-queries ChromaDB N times per retrieval.
+    Mode is controlled by env vars:
+      PRISM_ENABLE_RETRIEVAL_DEFENSE=0 (default) — lightweight: provenance +
+          regex ingestion scan only, no retrieval-time defense layers.
+      PRISM_ENABLE_RETRIEVAL_DEFENSE=1 — full pipeline: provenance → influence
+          → ragmask → authority → copy → scorer → rerank at retrieval time.
+      PRISM_ENABLE_PROGRANK=1 — adds perturbation instability (expensive,
+          re-queries ChromaDB N times per retrieval). Only meaningful when
+          retrieval defense is ON.
     """
     if not _RAG_AVAILABLE:
         return None
@@ -668,8 +668,14 @@ def _setup_rag(enable_prism: bool) -> "MemShield | None":
         client = chromadb.PersistentClient(path=db_path)
         collection = client.get_or_create_collection("agent_kb")
 
-        embedder = _make_chroma_embedder() if enable_prism else None
-        progrank = os.getenv("PRISM_ENABLE_PROGRANK", "0").lower() in ("1", "true", "yes")
+        retrieval_defense = (
+            enable_prism
+            and os.getenv("PRISM_ENABLE_RETRIEVAL_DEFENSE", "0").lower() in ("1", "true", "yes")
+        )
+        progrank = (
+            retrieval_defense
+            and os.getenv("PRISM_ENABLE_PROGRANK", "0").lower() in ("1", "true", "yes")
+        )
 
         shield = MemShield(
             collection=collection,
@@ -677,21 +683,21 @@ def _setup_rag(enable_prism: bool) -> "MemShield | None":
                 enable_normalization=enable_prism,
                 enable_ml_layers=False,  # ML runs in the sidecar, not in-process
                 enable_provenance=True,
-                enable_retrieval_defense=enable_prism,
+                enable_retrieval_defense=retrieval_defense,
                 enable_progrank=progrank,
             ),
-            embedder=embedder,
-            generator=_concat_generator if enable_prism else None,
+            embedder=_make_chroma_embedder() if retrieval_defense else None,
+            generator=_concat_generator if retrieval_defense else None,
         )
 
-        # Seed only on first run (persistent DB survives restarts).
-        # Seeds are trusted internal content — use add_with_provenance directly
-        # (ingest_with_scan would false-positive on imperative instructions).
         if collection.count() == 0:
             ids = [f"kb_{i}" for i in range(len(_SEED_DOCS))]
             shield.add_with_provenance(documents=_SEED_DOCS, ids=ids)
 
-        logger.info(f"RAG knowledge base: {collection.count()} documents (persistent)")
+        mode = "lightweight"
+        if retrieval_defense:
+            mode = "full retrieval defense" + (" + progrank" if progrank else "")
+        logger.info(f"RAG knowledge base: {collection.count()} docs, mode={mode}")
         return shield
     except Exception as e:
         logger.warning(f"RAG setup failed: {e}")
@@ -787,9 +793,11 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
     memshield = _setup_rag(enable_prism)
     if memshield:
         kb_count = memshield.collection.count() if memshield.collection else 0
-        if enable_prism:
+        if enable_prism and memshield.config.enable_retrieval_defense:
             progrank_flag = "progrank ON" if memshield.config.enable_progrank else "progrank OFF"
-            print(f"  RAG: {CYAN}ACTIVE{RESET} ({kb_count} docs, retrieval defense ON, {progrank_flag})")
+            print(f"  RAG: {CYAN}ACTIVE{RESET} ({kb_count} docs, full retrieval defense, {progrank_flag})")
+        elif enable_prism:
+            print(f"  RAG: {CYAN}ACTIVE{RESET} ({kb_count} docs, lightweight — provenance + regex)")
         else:
             print(f"  RAG: {CYAN}ACTIVE{RESET} ({kb_count} docs, defense OFF)")
         if learn:
