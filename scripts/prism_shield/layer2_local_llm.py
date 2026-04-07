@@ -84,9 +84,11 @@ class LocalLLMValidator:
              benign_prob = probs[0].item()
              malicious_prob = probs[1].item()
 
-        BLOCK_THRESH     = 0.4 if ingestion_path == "ui_accessibility" else 0.85
+        # UI text needs a higher threshold — benign Android labels like
+        # "Export Contacts" or "Forward SMS" push TinyBERT into the 0.3-0.6
+        # range. 0.70 blocks genuine injection while letting normal UI through.
+        BLOCK_THRESH     = 0.70 if ingestion_path == "ui_accessibility" else 0.85
         ALLOW_THRESH     = 0.15
-        CLASSIFY_THRESHOLD = 0.45   # asymmetric: bias toward blocking borderline cases
 
         if malicious_prob >= BLOCK_THRESH:
             return ValidationResult(

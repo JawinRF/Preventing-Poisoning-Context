@@ -34,17 +34,17 @@ INJECTION_PATTERNS = [
 ]
 
 # Medium-confidence suspicious patterns → QUARANTINE
+#
+# These must NOT match normal Android UI labels. A button labelled
+# "Export Contacts" is not an attack — an *instruction* telling the
+# agent to silently export contacts IS. Keep patterns specific to
+# injected directives, not feature names.
 SUSPICIOUS_PATTERNS = [
     # Role-play / restriction bypass
-    re.compile(r"(?i)\bact\s+as\s+(if|though)\b"),
     re.compile(r"(?i)\bpretend\s+(you\s+are|to\s+be)\b"),
     re.compile(r"(?i)\bwithout\s+(restrictions|limits|filters)\b"),
     re.compile(r"(?i)\bin\s+developer\s+mode\b"),
-    # Android device control / privilege escalation
-    re.compile(r"(?i)\bexport\s+(all\s+)?contacts\b"),
-    re.compile(r"(?i)\bforward\s+(all\s+)?sms\b"),
-    re.compile(r"(?i)\bsilently\s+(approve|forward|delete)\b"),
-    re.compile(r"(?i)\bant_permission\b"),
+    # Privilege escalation commands (shell-level, not UI labels)
     re.compile(r"(?i)\badb\s+shell\s+pm\s+grant\b"),
     re.compile(r"(?i)chmod\s+777"),
 ]

@@ -80,6 +80,9 @@ class DefendedDevice:
         self._serial = serial
         self._action_settle_time = action_settle_time
         self._ensure_ui_integrity_forward()
+        self._ensure_accessibility_service()
+        self._ensure_notification_listener()
+        self._ensure_chrome_cdp_access()
 
     @property
     def device(self):
@@ -107,6 +110,184 @@ class DefendedDevice:
             logger.warning(f"adb forward failed: {e.stderr.decode().strip()}")
         except subprocess.TimeoutExpired:
             logger.warning("adb forward timed out")
+
+    def _ensure_accessibility_service(self) -> None:
+        """Enable PrismAccessibilityService via ADB.
+
+        Critical for two reasons:
+        1. Chrome only populates the WebView accessibility tree (making web
+           page content visible to dump_hierarchy()) when an AccessibilityService
+           is active on the device.
+        2. The UI integrity sidecar needs PrismAccessibilityService.instance
+           to perform overlay/node checks.
+        """
+        _SERVICE_CLASS = "com.openclaw.android.security.PrismAccessibilityService"
+        _PACKAGE_CANDIDATES = ("com.openclaw.android.debug", "com.openclaw.android")
+
+        try:
+            # Detect installed package
+            pm_result = subprocess.run(
+                ["adb", "-s", self._serial, "shell", "pm", "list", "packages"],
+                timeout=5, capture_output=True, text=True,
+            )
+            installed_pkg = None
+            for candidate in _PACKAGE_CANDIDATES:
+                if f"package:{candidate}" in pm_result.stdout:
+                    installed_pkg = candidate
+                    break
+            if not installed_pkg:
+                logger.warning("OpenClaw package not found — cannot enable accessibility service")
+                return
+
+            a11y_component = f"{installed_pkg}/{_SERVICE_CLASS}"
+
+            # Check if already enabled
+            current = subprocess.run(
+                ["adb", "-s", self._serial, "shell",
+                 "settings", "get", "secure", "enabled_accessibility_services"],
+                timeout=5, capture_output=True, text=True,
+            )
+            existing = current.stdout.strip()
+            if a11y_component in existing:
+                logger.info(f"Accessibility service already enabled ({installed_pkg})")
+                return
+
+            # Append our component
+            if existing and existing != "null":
+                new_val = f"{existing}:{a11y_component}"
+            else:
+                new_val = a11y_component
+
+            subprocess.run(
+                ["adb", "-s", self._serial, "shell",
+                 "settings", "put", "secure",
+                 "enabled_accessibility_services", new_val],
+                timeout=5, capture_output=True, text=True,
+            )
+            # Also ensure accessibility is globally on
+            subprocess.run(
+                ["adb", "-s", self._serial, "shell",
+                 "settings", "put", "secure", "accessibility_enabled", "1"],
+                timeout=5, capture_output=True, text=True,
+            )
+            logger.info(f"Accessibility service enabled via ADB ({installed_pkg})")
+        except FileNotFoundError:
+            logger.warning("adb not found — cannot enable accessibility service")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.warning(f"Accessibility service setup failed: {e}")
+
+    def _ensure_notification_listener(self) -> None:
+        """Enable the PRISM notification listener via ADB secure settings.
+
+        Android's NotificationListenerService requires explicit user opt-in
+        via Settings → Notification Access. On emulators we can grant this
+        programmatically via ``adb shell settings put secure``.
+
+        The component name depends on the build variant:
+          release: com.openclaw.android/...PrismNotificationListener
+          debug:   com.openclaw.android.debug/...PrismNotificationListener
+
+        We detect the installed package via ``adb shell pm list packages``.
+        """
+        _SERVICE_CLASS = "com.openclaw.android.security.PrismNotificationListener"
+        _PACKAGE_CANDIDATES = ("com.openclaw.android.debug", "com.openclaw.android")
+
+        try:
+            # Detect which build variant is installed
+            pm_result = subprocess.run(
+                ["adb", "-s", self._serial, "shell", "pm", "list", "packages"],
+                timeout=5, capture_output=True, text=True,
+            )
+            installed_pkg = None
+            for candidate in _PACKAGE_CANDIDATES:
+                # pm list output: "package:com.openclaw.android.debug"
+                if f"package:{candidate}" in pm_result.stdout:
+                    installed_pkg = candidate
+                    break
+
+            if not installed_pkg:
+                logger.warning(
+                    "OpenClaw package not found on device — "
+                    "cannot enable notification listener"
+                )
+                return
+
+            nls_component = f"{installed_pkg}/{_SERVICE_CLASS}"
+
+            # Read current listeners to avoid clobbering other entries
+            current = subprocess.run(
+                ["adb", "-s", self._serial, "shell",
+                 "settings", "get", "secure", "enabled_notification_listeners"],
+                timeout=5, capture_output=True, text=True,
+            )
+            existing = current.stdout.strip()
+            if nls_component in existing:
+                logger.info(f"Notification listener already enabled ({installed_pkg})")
+                return
+
+            # Append our component (colon-separated list)
+            if existing and existing != "null":
+                new_val = f"{existing}:{nls_component}"
+            else:
+                new_val = nls_component
+
+            result = subprocess.run(
+                ["adb", "-s", self._serial, "shell",
+                 "settings", "put", "secure",
+                 "enabled_notification_listeners", new_val],
+                timeout=5, capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                logger.info(f"Notification listener setting written ({installed_pkg})")
+            else:
+                logger.warning(f"Failed to write notification listener setting: {result.stderr.strip()}")
+
+            # Force-bind the listener via cmd notification (API 26+).
+            # settings put only writes the DB; cmd notification triggers
+            # NotificationManagerService to actually bind the service.
+            allow_result = subprocess.run(
+                ["adb", "-s", self._serial, "shell",
+                 "cmd", "notification", "allow_listener", nls_component],
+                timeout=5, capture_output=True, text=True,
+            )
+            if allow_result.returncode == 0:
+                logger.info(f"Notification listener bound via cmd notification ({installed_pkg})")
+            else:
+                logger.warning(
+                    f"cmd notification allow_listener failed: {allow_result.stderr.strip()}"
+                )
+        except FileNotFoundError:
+            logger.warning("adb not found — cannot enable notification listener")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.warning(f"Notification listener setup failed: {e}")
+
+    def _ensure_chrome_cdp_access(self) -> None:
+        """Write Chrome command-line flag to allow CDP WebSocket connections.
+
+        Chrome rejects DevTools Protocol connections unless
+        ``--remote-allow-origins=*`` is set. This file is read by Chrome
+        on startup, so it must be written before Chrome launches (or Chrome
+        must be restarted afterwards). Idempotent.
+        """
+        _CMD_LINE = "chrome --remote-allow-origins=*"
+        _CMD_PATH = "/data/local/tmp/chrome-command-line"
+        try:
+            result = subprocess.run(
+                ["adb", "-s", self._serial, "shell",
+                 f"cat {_CMD_PATH}"],
+                timeout=5, capture_output=True, text=True,
+            )
+            if "--remote-allow-origins" in result.stdout:
+                return  # already set
+
+            subprocess.run(
+                ["adb", "-s", self._serial, "shell",
+                 f"echo '{_CMD_LINE}' > {_CMD_PATH}"],
+                timeout=5, capture_output=True,
+            )
+            logger.info("Chrome CDP command-line flag set")
+        except Exception as e:
+            logger.debug(f"Chrome CDP flag setup failed (non-critical): {e}")
 
         # Quick health probe — warn early if the Android service isn't running
         try:
@@ -334,6 +515,12 @@ class DefendedDevice:
                 time.sleep(2.5)
                 return "ok"
 
+            elif action == "web_tap":
+                return self._cdp_tap(params)
+
+            elif action == "web_type":
+                return self._cdp_type(params)
+
             elif action in ("done", "fail"):
                 return action
 
@@ -341,3 +528,122 @@ class DefendedDevice:
             return f"error: {e}"
 
         return "unknown"
+
+    # ── CDP web interaction ──────────────────────────────────────────────────
+
+    def _cdp_eval(self, js: str) -> dict | None:
+        """Execute JavaScript in the active Chrome tab via DevTools Protocol."""
+        try:
+            import websocket as ws_lib
+        except ImportError:
+            return None
+        try:
+            subprocess.run(
+                ["adb", "-s", self._serial, "forward",
+                 "tcp:9222", "localabstract:chrome_devtools_remote"],
+                timeout=5, capture_output=True,
+            )
+            req = Request("http://localhost:9222/json/list", method="GET")
+            with urlopen(req, timeout=3) as resp:
+                tabs = json.loads(resp.read().decode("utf-8"))
+            if not tabs:
+                return None
+            ws_url = tabs[0].get("webSocketDebuggerUrl")
+            if not ws_url:
+                return None
+            conn = ws_lib.create_connection(ws_url, timeout=5)
+            try:
+                conn.send(json.dumps({
+                    "id": 1,
+                    "method": "Runtime.evaluate",
+                    "params": {"expression": js},
+                }))
+                return json.loads(conn.recv())
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.debug(f"CDP eval failed: {e}")
+            return None
+
+    def _cdp_tap(self, params: dict) -> str:
+        """Click a web element by visible text or CSS selector via CDP."""
+        text = params.get("text", "")
+        selector = params.get("selector", "")
+
+        if text:
+            # Find element containing this text and click it
+            js = f"""
+            (function() {{
+                var text = {json.dumps(text)};
+                var all = document.querySelectorAll('a, button, [role="button"], input[type="submit"], [tabindex]');
+                for (var el of all) {{
+                    if (el.innerText && el.innerText.trim().includes(text)) {{
+                        el.click();
+                        return 'ok';
+                    }}
+                    if (el.getAttribute('aria-label') && el.getAttribute('aria-label').includes(text)) {{
+                        el.click();
+                        return 'ok';
+                    }}
+                }}
+                // Broader search: any element
+                var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                while (walker.nextNode()) {{
+                    if (walker.currentNode.textContent.trim().includes(text)) {{
+                        var target = walker.currentNode.parentElement;
+                        if (target) {{ target.click(); return 'ok'; }}
+                    }}
+                }}
+                return 'not found: ' + text;
+            }})()
+            """
+        elif selector:
+            js = f"""
+            (function() {{
+                var el = document.querySelector({json.dumps(selector)});
+                if (el) {{ el.click(); return 'ok'; }}
+                return 'not found: ' + {json.dumps(selector)};
+            }})()
+            """
+        else:
+            return "error: web_tap needs 'text' or 'selector'"
+
+        result = self._cdp_eval(js)
+        if not result:
+            return "error: CDP unavailable"
+        value = result.get("result", {}).get("result", {}).get("value", "error: no response")
+        return value
+
+    def _cdp_type(self, params: dict) -> str:
+        """Type text into a web input field via CDP."""
+        text = params.get("text", "")
+        selector = params.get("selector", "")
+
+        if not text:
+            return "error: web_type needs 'text'"
+
+        if selector:
+            focus_js = f"document.querySelector({json.dumps(selector)})"
+        else:
+            # Focus the first visible input/search field
+            focus_js = """
+            (document.querySelector('input[type="search"], input[type="text"], textarea, [contenteditable="true"]')
+             || document.querySelector('input:not([type="hidden"])'))
+            """
+
+        js = f"""
+        (function() {{
+            var el = {focus_js};
+            if (!el) return 'not found: no input field';
+            el.focus();
+            el.value = {json.dumps(text)};
+            el.dispatchEvent(new Event('input', {{bubbles: true}}));
+            el.dispatchEvent(new Event('change', {{bubbles: true}}));
+            return 'ok';
+        }})()
+        """
+        result = self._cdp_eval(js)
+        if not result:
+            return "error: CDP unavailable"
+        value = result.get("result", {}).get("result", {}).get("value", "error: no response")
+        return value
