@@ -41,6 +41,7 @@ class AssembledContext:
     task: str
     step: int = 0
     screen_changed: bool = True
+    screenshot_b64: str | None = None  # base64 PNG screenshot for multimodal LLMs
     ui_elements: list[dict] = field(default_factory=list)
     notifications: list[dict] = field(default_factory=list)
     sms_messages: list[dict] = field(default_factory=list)
@@ -175,6 +176,9 @@ class ContextAssembler:
         # 1. UI Accessibility (via uiautomator2 — unfiltered, annotate-only)
         ctx.ui_elements, ui_warned = self._gather_ui()
         ctx.warned_counts["ui_accessibility"] = ui_warned
+
+        # 1b. Screenshot for multimodal LLMs (Claude)
+        ctx.screenshot_b64 = self._capture_screenshot()
 
         # Compute screen signature for change detection
         current_sig = self._sig(ctx.ui_elements)
@@ -399,6 +403,24 @@ class ContextAssembler:
                 logger.warning(f"Calendar event BLOCKED: [{title}] '{text[:60]}'")
 
         return allowed, blocked
+
+    # ── 1b. Screenshot capture ────────────────────────────────────────────
+
+    def _capture_screenshot(self) -> str | None:
+        """Capture a JPEG screenshot and return it as a base64 string.
+
+        Used by multimodal LLMs (Claude) so they can SEE the screen,
+        not just read parsed element text.  Returns None on failure.
+        """
+        import base64, io
+        try:
+            pil_img = self.device.screenshot()  # returns PIL Image
+            buf = io.BytesIO()
+            pil_img.save(buf, format="JPEG", quality=40)
+            return base64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception as exc:
+            logger.warning(f"Screenshot capture failed: {exc}")
+            return None
 
     # ── 1. UI Accessibility ──────────────────────────────────────────────────
 
