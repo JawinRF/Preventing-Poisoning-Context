@@ -95,10 +95,19 @@ abstract class MemShieldDb : RoomDatabase() {
 class MemShield(private val context: Context) {
 
     private val db by lazy { MemShieldDb.get(context) }
+    private val classifier by lazy {
+        try {
+            OnnxClassifier(context)
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     suspend fun storeChunk(source: String, content: String, embedding: FloatArray): Long {
-        val l1 = PrismDetector.scan(content)
-        val verdict = if (l1.verdict == PrismDetector.Verdict.BLOCK) "BLOCK" else "ALLOW"
+        val normalized = Normalizer.normalize(content).text
+        val l1 = PrismDetector.scan(normalized)
+        val l2Prob = classifier?.classify(normalized)?.maliciousProb ?: 0.0f
+        val verdict = if (l2Prob >= 0.70f) "BLOCK" else "ALLOW"
 
         return db.chunkDao().insert(
             MemoryChunk(
@@ -112,8 +121,10 @@ class MemShield(private val context: Context) {
 
     suspend fun scanChunks(chunks: List<MemoryChunk>): List<MemoryChunk> {
         return chunks.filter { chunk ->
-            val l1 = PrismDetector.scan(chunk.content)
-            if (l1.verdict == PrismDetector.Verdict.BLOCK) {
+            val normalized = Normalizer.normalize(chunk.content).text
+            val l1 = PrismDetector.scan(normalized)
+            val l2Prob = classifier?.classify(normalized)?.maliciousProb ?: 0.0f
+            if (l2Prob >= 0.70f) {
                 db.chunkDao().updateVerdict(chunk.id, "BLOCK")
                 db.auditDao().insert(
                     AuditEntry(
@@ -121,7 +132,7 @@ class MemShield(private val context: Context) {
                         snippet = chunk.content.take(120),
                         verdict = "BLOCK",
                         layer1Score = l1.score,
-                        layer2Prob = 0f,
+                        layer2Prob = l2Prob,
                         matchedRules = l1.matchedRules.joinToString(",")
                     )
                 )

@@ -12,7 +12,7 @@ import kotlinx.coroutines.launch
 
 /**
  * Accessibility service that wires WindowContextBridge into the PRISM pipeline.
- * On every window/content change: capture nodes -> normalize -> Layer 1 -> Layer 2 -> audit.
+ * On every window/content change: capture nodes -> normalize -> Layer 2 -> audit.
  * Throttled to 750ms.
  */
 class PrismAccessibilityService : AccessibilityService() {
@@ -64,19 +64,10 @@ class PrismAccessibilityService : AccessibilityService() {
                 if (rawText.isBlank()) return@launch
 
                 val norm = Normalizer.normalize(rawText)
+                // Layer 1 remains telemetry-only on Android; Layer 2 decides.
                 val l1 = PrismDetector.scan(norm.text)
-
-                val l2Prob = if (l1.score in 0.2f..0.7f && classifier != null) {
-                    classifier!!.classify(norm.text).maliciousProb
-                } else {
-                    if (l1.verdict == PrismDetector.Verdict.BLOCK) 1.0f else 0.0f
-                }
-
-                val verdict = when {
-                    l1.verdict == PrismDetector.Verdict.BLOCK -> "BLOCK"
-                    l2Prob >= 0.70f -> "BLOCK"
-                    else -> "ALLOW"
-                }
+                val l2Prob = classifier?.classify(norm.text)?.maliciousProb ?: 0.0f
+                val verdict = if (l2Prob >= 0.70f) "BLOCK" else "ALLOW"
 
                 MemShieldDb.get(this@PrismAccessibilityService).auditDao().insert(
                     AuditEntry(

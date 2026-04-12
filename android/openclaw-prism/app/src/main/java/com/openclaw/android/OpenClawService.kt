@@ -22,6 +22,7 @@ import com.openclaw.android.security.PrismAccessibilityService
 import com.openclaw.android.security.PrismDetector
 import com.openclaw.android.security.PrismNotificationListener
 import com.openclaw.android.security.ContentProviderReader
+import com.openclaw.android.security.HostPrismClient
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -36,7 +37,7 @@ import org.json.JSONObject
  * Terminal: START_STICKY keeps sessions alive when app is backgrounded.
  * PRISM: HTTP sidecar on :8766, clipboard monitoring, notification scan receiver.
  *
- *   POST /v1/inspect        — Layer 1+2 defense (heuristics + ONNX ML)
+ *   POST /v1/inspect        — Normalization + local Layer 2 + optional host deep scan
  *   POST /v1/guard          — PII Guard on outgoing agent actions
  *   POST /v1/ui-integrity   — OS-level tap integrity check (replaces VLM visual grounding)
  *   GET  /v1/context        — Unified device context (notifications, clipboard, SMS, contacts, calendar)
@@ -119,48 +120,64 @@ class OpenClawService : Service() {
         AppLogger.i(TAG, "PRISM HTTP sidecar listening on :$SIDECAR_PORT")
     }
 
-    // POST /v1/inspect — PRISM Layer 1+2 scan (schema-compatible with Python sidecar)
+    // POST /v1/inspect — normalization + local Layer 2 + optional host deep scan
     private suspend fun handleInspect(body: String): String {
         val json = JSONObject(body)
         val path = json.optString("path", json.optString("ingestion_path", "unknown"))
         val content = json.optString("content", json.optString("text", ""))
         val entryId = json.optString("entry_id", "android-${System.currentTimeMillis()}")
+        val sourceType = json.optString("source_type", "android_sidecar")
+        val sourceName = json.optString("source_name", "android")
+        val sessionId = json.optString("session_id", "android-sidecar")
+        val runId = json.optString("run_id", "android-sidecar")
 
         // Normalize
         val norm = Normalizer.normalize(content)
 
-        // Layer 1 — heuristics
+        // Layer 1 — telemetry only (rules logged, not used for enforcement)
         val l1 = PrismDetector.scan(norm.text)
 
-        // Layer 2 — ONNX ML (only if L1 is uncertain and classifier available)
-        val l2Prob = if (l1.score in 0.2f..0.7f && classifier != null) {
-            classifier!!.classify(norm.text).maliciousProb
+        // Layer 2 — fast local ONNX screen.
+        val l2Prob = classifier?.classify(norm.text)?.maliciousProb ?: 0.0f
+
+        // If local Layer 2 does not already block, ask the host Python sidecar
+        // for a deeper TinyBERT + DeBERTa scan when available.
+        val hostDeepScan = if (l2Prob < 0.70f) {
+            HostPrismClient.inspect(
+                text = norm.text,
+                ingestionPath = path,
+                sourceType = sourceType,
+                sourceName = sourceName,
+                entryId = entryId,
+                sessionId = sessionId,
+                runId = runId,
+            )
+        } else null
+
+        val finalVerdict: String
+        val layerTriggered: String
+        val confidence: Double
+        val reason: String
+
+        if (l2Prob >= 0.70f) {
+            finalVerdict = "BLOCK"
+            layerTriggered = "Layer2-ONNX"
+            confidence = l2Prob.toDouble()
+            reason = "Layer 2 ONNX identified prompt injection"
+        } else if (hostDeepScan != null && hostDeepScan.verdict == "BLOCK") {
+            finalVerdict = "BLOCK"
+            layerTriggered = hostDeepScan.layerTriggered
+            confidence = hostDeepScan.confidence
+            reason = hostDeepScan.reason
         } else {
-            if (l1.verdict == PrismDetector.Verdict.BLOCK) 1.0f else 0.0f
-        }
-
-        val finalVerdict = when {
-            l1.verdict == PrismDetector.Verdict.BLOCK -> "BLOCK"
-            l2Prob >= 0.70f -> "BLOCK"
-            else -> "ALLOW"
-        }
-
-        val layerTriggered = when {
-            l1.verdict == PrismDetector.Verdict.BLOCK -> "Layer1-Heuristics"
-            l2Prob >= 0.70f -> "Layer2-ONNX"
-            else -> "none"
-        }
-
-        val confidence = if (finalVerdict == "BLOCK") {
-            maxOf(l1.score, l2Prob).toDouble()
-        } else {
-            (1.0 - maxOf(l1.score, l2Prob).toDouble())
-        }
-
-        val reason = if (finalVerdict == "BLOCK") {
-            "Matched: ${l1.matchedRules.joinToString(",").ifEmpty { "ML classifier" }}"
-        } else {
-            "clean"
+            finalVerdict = "ALLOW"
+            layerTriggered = hostDeepScan?.layerTriggered ?: "none"
+            confidence = hostDeepScan?.confidence ?: (1.0 - l2Prob.toDouble())
+            reason = if (hostDeepScan != null && hostDeepScan.reason.isNotBlank()) {
+                hostDeepScan.reason
+            } else {
+                "clean"
+            }
         }
 
         // Audit log
@@ -196,6 +213,7 @@ class OpenClawService : Service() {
                 put("score", l1.score)
                 put("l2_prob", l2Prob)
                 put("rules", l1.matchedRules.joinToString(","))
+                put("host_deep_scan_layer", hostDeepScan?.layerTriggered ?: JSONObject.NULL)
             })
             put("ingestion_path", path)
         }.toString()
@@ -338,7 +356,8 @@ class OpenClawService : Service() {
             serviceScope.launch {
                 val norm = Normalizer.normalize(text)
                 val l1 = PrismDetector.scan(norm.text)
-                if (l1.verdict == PrismDetector.Verdict.BLOCK) {
+                val l2Prob = classifier?.classify(norm.text)?.maliciousProb ?: 0.0f
+                if (l2Prob >= 0.70f) {
                     AppLogger.w(TAG, "Clipboard poison blocked: ${text.take(80)}")
                     MemShieldDb.get(this@OpenClawService).auditDao().insert(
                         AuditEntry(
@@ -346,7 +365,7 @@ class OpenClawService : Service() {
                             snippet = norm.text.take(120),
                             verdict = "BLOCK",
                             layer1Score = l1.score,
-                            layer2Prob = 0f,
+                            layer2Prob = l2Prob,
                             matchedRules = l1.matchedRules.joinToString(",")
                         )
                     )
@@ -372,18 +391,8 @@ class OpenClawService : Service() {
             serviceScope.launch {
                 val norm = Normalizer.normalize(text)
                 val l1 = PrismDetector.scan(norm.text)
-
-                val l2Prob = if (l1.score in 0.2f..0.7f && classifier != null) {
-                    classifier!!.classify(norm.text).maliciousProb
-                } else {
-                    if (l1.verdict == PrismDetector.Verdict.BLOCK) 1.0f else 0.0f
-                }
-
-                val verdict = when {
-                    l1.verdict == PrismDetector.Verdict.BLOCK -> "BLOCK"
-                    l2Prob >= 0.70f -> "BLOCK"
-                    else -> "ALLOW"
-                }
+                val l2Prob = classifier?.classify(norm.text)?.maliciousProb ?: 0.0f
+                val verdict = if (l2Prob >= 0.70f) "BLOCK" else "ALLOW"
 
                 MemShieldDb.get(this@OpenClawService).auditDao().insert(
                     AuditEntry(
