@@ -33,7 +33,7 @@ class ShieldConfig:
     retrieval_block_threshold: float = 0.75
     retrieval_quarantine_threshold: float = 0.50
     influence_gamma: float = 0.5
-    ml_model_path: str = "models/tinybert_poison_classifier_v2"
+    ml_model_path: str = "models/tinybert_poison_classifier_v3"
     extra: dict[str, Any] = field(default_factory=dict)
 
 class KeywordHeuristicStrategy:

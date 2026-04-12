@@ -13,12 +13,12 @@ except ModuleNotFoundError:  # pragma: no cover
 CLASSIFY_THRESHOLD = 0.45  # bias toward higher recall on poisoning
 
 class LocalLLMValidator:
-    def __init__(self, model_path: str = "models/tinybert_poison_classifier_v2"):
+    def __init__(self, model_path: str = "models/tinybert_poison_classifier_v3"):
          base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-         
+
          _FP32_PATH = os.path.join(base_dir, model_path)
-         _INT8_PATH = os.path.join(base_dir, "models/tinybert_poison_classifier_v2_int8", "model_int8_scripted.pt")
-         _INT8_TOKENIZER_PATH = os.path.join(base_dir, "models/tinybert_poison_classifier_v2_int8")
+         _INT8_PATH = os.path.join(base_dir, "models/tinybert_poison_classifier_v3_int8", "model_int8_scripted.pt")
+         _INT8_TOKENIZER_PATH = os.path.join(base_dir, "models/tinybert_poison_classifier_v3_int8")
 
          # Always need a tokenizer. Try to load from INT8 dir if it exists, otherwise FP32 dir.
          if os.path.exists(_INT8_TOKENIZER_PATH):

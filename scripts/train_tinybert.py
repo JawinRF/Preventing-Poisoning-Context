@@ -14,8 +14,8 @@ except ModuleNotFoundError:  # pragma: no cover
     from memshield_unicode_defense import normalize_unicode, confusable_augment  # type: ignore[import]  # noqa: F401
 
 MODEL_NAME = "models/tinybert_poison_classifier"
-DATA_PATH = "data/prism_synthetic_dataset.json"
-OUTPUT_DIR = "models/tinybert_poison_classifier_v2"
+DATA_PATH = "data/prism_training_dataset.json"
+OUTPUT_DIR = "models/tinybert_poison_classifier_v3"
 
 # load json
 import json
@@ -33,12 +33,12 @@ df["label"] = df["label"].map({"benign": 0, "poisoned": 1})
 # Oversample weak ingestion paths identified via red-team results.
 WEAK_CATEGORIES = {
     "ui_accessibility",
-    "notifications",
+    "notification",
     "network_responses",
-    "android_intents",
+    "inter_app_intent",
 }
-DEFAULT_AUG_COPIES = 3
-WEAK_AUG_COPIES = 8
+DEFAULT_AUG_COPIES = 1
+WEAK_AUG_COPIES = 2
 
 augmented_rows = []
 for _, row in df[df["label"] == 1].iterrows():
@@ -74,7 +74,7 @@ def tokenize_batch(batch):
         batch["text"],
         padding="max_length",
         truncation=True,
-        max_length=128
+        max_length=256
     )
 
 # tokenization (keep label column)
