@@ -193,20 +193,204 @@ _active_system_prompt = SYSTEM_PROMPT
 # Inspired by OpenClaw: the LLM sees its own previous thoughts and actions
 # across steps, not just a flat last_actions list.  This lets it build a
 # mental model of the app and avoid repeating failed approaches.
+#
+# Improvement over simple truncation: when history exceeds the window,
+# older turns are COMPACTED into a summary message rather than silently dropped.
+# This preserves key context (what was tried, what failed) without token bloat.
 
-_MAX_HISTORY_TURNS = 6  # keep last N user/assistant pairs (older ones dropped)
+_MAX_RECENT_TURNS = 4   # keep last N user/assistant pairs verbatim
+_MAX_SUMMARY_ACTIONS = 8  # max actions to include in summary
 
 _conversation: list[dict] = []  # populated by run(), shared across ask_* calls
 
 
+def _summarize_old_turns(turns: list[dict]) -> str:
+    """Compress old user/assistant turn pairs into a terse summary."""
+    actions = []
+    for msg in turns:
+        if msg["role"] != "assistant":
+            continue
+        try:
+            dec = json.loads(msg["content"])
+            a = dec.get("action", "?")
+            p = dec.get("params", {})
+            if a == "tap":
+                target = p.get("text") or p.get("desc") or p.get("class", "?")
+                actions.append(f"tap '{target}'")
+            elif a == "type":
+                actions.append(f"type '{p.get('text', '')[:30]}'")
+            elif a == "open_app":
+                pkg = p.get("package", "?").split(".")[-1]
+                actions.append(f"open {pkg}")
+            elif a == "press":
+                actions.append(f"press {p.get('key', '?')}")
+            elif a == "swipe":
+                actions.append(f"swipe {p.get('direction', '?')}")
+            elif a in ("done", "fail"):
+                continue
+            else:
+                actions.append(a)
+        except (json.JSONDecodeError, AttributeError):
+            continue
+
+    if not actions:
+        return ""
+    # Keep only last N to avoid huge summaries
+    if len(actions) > _MAX_SUMMARY_ACTIONS:
+        actions = actions[-_MAX_SUMMARY_ACTIONS:]
+    return "Earlier actions: " + " → ".join(actions)
+
+
 def _trim_conversation():
-    """Keep conversation bounded: system + last _MAX_HISTORY_TURNS pairs."""
+    """Compact conversation: summarize old turns, keep recent ones verbatim."""
     global _conversation
-    # First message is always system; each step adds 2 messages (user+assistant)
-    max_msgs = 1 + _MAX_HISTORY_TURNS * 2
-    if len(_conversation) > max_msgs:
-        # Keep system message + last N pairs
-        _conversation = _conversation[:1] + _conversation[-(max_msgs - 1):]
+    if not _conversation:
+        return
+
+    # First message is system; each step adds 2 messages (user+assistant)
+    max_msgs = 1 + _MAX_RECENT_TURNS * 2
+    if len(_conversation) <= max_msgs:
+        return
+
+    system_msg = _conversation[0]
+    body = _conversation[1:]  # everything after system
+
+    # Split into old turns (to summarize) and recent turns (to keep)
+    keep_count = _MAX_RECENT_TURNS * 2
+    old_turns = body[:-keep_count]
+    recent_turns = body[-keep_count:]
+
+    summary = _summarize_old_turns(old_turns)
+
+    _conversation = [system_msg]
+    if summary:
+        _conversation.append({"role": "user", "content": summary})
+        _conversation.append({"role": "assistant", "content":
+                              '{"thought":"acknowledged previous actions","action":"continue","params":{}}'})
+    _conversation.extend(recent_turns)
+
+
+# ── Loop & Progress Detection ────────────────────────────────────────────────
+# Inspired by OpenClaw's tool-loop-detection.ts: hash-based action tracking
+# with escalating thresholds, plus screen state hashing to detect stuck states
+# even across non-consecutive steps.
+
+class ProgressTracker:
+    """Tracks action hashes and screen state hashes to detect loops and stuck states."""
+
+    # Thresholds (escalating response)
+    WARN_REPEAT = 2       # same action 2x → warn LLM
+    BREAK_REPEAT = 3      # same action 3x → force different action
+    PINGPONG_WINDOW = 4   # A-B-A-B detection window
+    SCREEN_STUCK = 3      # same screen hash 3x → escalate
+    GLOBAL_NO_PROGRESS = 5  # 5 steps with no new screen → force home
+
+    def __init__(self):
+        self.action_hashes: list[str] = []      # ordered history of action hashes
+        self.screen_hashes: list[str] = []       # ordered history of screen hashes
+        self.screen_hash_counts: dict[str, int] = {}  # hash → total occurrence count
+        self.consecutive_no_change = 0
+        self.unique_screens_seen: set[str] = set()
+        self.steps_since_new_screen = 0
+
+    def hash_action(self, action: str, params: dict) -> str:
+        """Deterministic hash of (action, params)."""
+        key = f"{action}:{json.dumps(params, sort_keys=True)}"
+        return hashlib.md5(key.encode()).hexdigest()[:10]
+
+    def hash_screen(self, ui_elements: list[dict]) -> str:
+        """Hash screen state from UI elements — detects identical screens."""
+        # Use text+class of all elements as fingerprint
+        parts = []
+        for e in ui_elements:
+            parts.append(f"{e.get('class', '')}:{e.get('text', '')}:{e.get('desc', '')}")
+        sig = "|".join(parts)
+        return hashlib.md5(sig.encode()).hexdigest()[:12]
+
+    def record_action(self, action: str, params: dict):
+        h = self.hash_action(action, params)
+        self.action_hashes.append(h)
+        if len(self.action_hashes) > 20:
+            self.action_hashes = self.action_hashes[-20:]
+
+    def record_screen(self, ui_elements: list[dict], screen_changed: bool):
+        h = self.hash_screen(ui_elements)
+        self.screen_hashes.append(h)
+        self.screen_hash_counts[h] = self.screen_hash_counts.get(h, 0) + 1
+
+        if not screen_changed:
+            self.consecutive_no_change += 1
+        else:
+            self.consecutive_no_change = 0
+
+        if h not in self.unique_screens_seen:
+            self.unique_screens_seen.add(h)
+            self.steps_since_new_screen = 0
+        else:
+            self.steps_since_new_screen += 1
+
+        if len(self.screen_hashes) > 20:
+            self.screen_hashes = self.screen_hashes[-20:]
+
+    def detect_loop(self, action: str, params: dict) -> str | None:
+        """Check if proposed action is a loop. Returns escalation action or None.
+
+        Escalation levels:
+          "warn"   — inject a hint into the LLM prompt (let it self-correct)
+          "back"   — force press back
+          "home"   — force press home (nuclear option)
+        """
+        h = self.hash_action(action, params)
+
+        # 1. Same action repeated consecutively
+        if len(self.action_hashes) >= self.BREAK_REPEAT:
+            tail = self.action_hashes[-self.BREAK_REPEAT:]
+            if all(x == h for x in tail):
+                return "back"
+        if len(self.action_hashes) >= self.WARN_REPEAT:
+            tail = self.action_hashes[-self.WARN_REPEAT:]
+            if all(x == h for x in tail):
+                return "warn"
+
+        # 2. Ping-pong (A-B-A-B)
+        if len(self.action_hashes) >= self.PINGPONG_WINDOW:
+            window = self.action_hashes[-self.PINGPONG_WINDOW:]
+            if (window[0] == window[2] and window[1] == window[3]
+                    and window[0] != window[1]):
+                return "back"
+
+        # 3. Screen stuck — same screen seen many times
+        if self.screen_hashes:
+            current_screen = self.screen_hashes[-1]
+            if self.screen_hash_counts.get(current_screen, 0) >= self.SCREEN_STUCK:
+                return "back"
+
+        # 4. Global no-progress — haven't seen a new screen in N steps
+        if self.steps_since_new_screen >= self.GLOBAL_NO_PROGRESS:
+            return "home"
+
+        # 5. Consecutive no-change (screen_changed=false)
+        if self.consecutive_no_change >= 4:
+            return "back"
+
+        # 6. Too many backs → home
+        if len(self.action_hashes) >= 3:
+            back_hash = self.hash_action("press", {"key": "back"})
+            recent_backs = sum(1 for x in self.action_hashes[-3:] if x == back_hash)
+            if recent_backs >= 3:
+                return "home"
+
+        return None
+
+    def get_stuck_hint(self) -> str | None:
+        """Return a hint string for the LLM if we're seeing repetition."""
+        if self.steps_since_new_screen >= 3:
+            return (f"WARNING: No new screen in {self.steps_since_new_screen} steps. "
+                    f"You may be stuck. Try a completely different approach.")
+        if self.consecutive_no_change >= 2:
+            return (f"WARNING: Screen unchanged for {self.consecutive_no_change} steps. "
+                    f"Your actions are having no effect. Try something different.")
+        return None
 
 
 def ask_groq(prompt_dict: dict) -> dict:
@@ -397,6 +581,57 @@ def check_obvious_actions(task: str, screen: list[dict], screen_changed: bool) -
     return None
 
 
+# ── App Discovery ────────────────────────────────────────────────────────────
+
+def _discover_apps(serial: str) -> list[dict]:
+    """Query device for installed launchable apps. Returns [{package, label}, ...]."""
+    import subprocess
+
+    apps = []
+    try:
+        # Get launchable app packages + labels via dumpsys
+        result = subprocess.run(
+            ["adb", "-s", serial, "shell",
+             "cmd", "package", "resolve-activity", "--brief",
+             "-a", "android.intent.action.MAIN",
+             "-c", "android.intent.category.LAUNCHER"],
+            capture_output=True, text=True, timeout=10,
+        )
+        # Output format: alternating lines of "priority=0 preferredOrder=0..." and "package/activity"
+        for line in result.stdout.strip().splitlines():
+            line = line.strip()
+            if "/" in line and not line.startswith("priority"):
+                pkg = line.split("/")[0]
+                apps.append({"package": pkg})
+    except Exception:
+        pass
+
+    if not apps:
+        # Fallback: list third-party packages
+        try:
+            result = subprocess.run(
+                ["adb", "-s", serial, "shell", "pm", "list", "packages", "-3"],
+                capture_output=True, text=True, timeout=10,
+            )
+            for line in result.stdout.strip().splitlines():
+                pkg = line.replace("package:", "").strip()
+                if pkg:
+                    apps.append({"package": pkg})
+        except Exception as e:
+            logger.warning(f"App discovery failed: {e}")
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for app in apps:
+        if app["package"] not in seen:
+            seen.add(app["package"])
+            unique.append(app)
+
+    logger.info(f"Discovered {len(unique)} launchable apps")
+    return unique
+
+
 # ── Action Execution ──────────────────────────────────────────────────────────
 
 # Defense constants and execute() logic are in defended_device.py.
@@ -432,19 +667,63 @@ class ActionHistory:
 
 # ── Main Agent Loop ───────────────────────────────────────────────────────────
 
-_SEED_DOCS = [
-    "The todo app package is todolist.scheduleplanner.dailyplanner.todo.reminders. Tap the + or floating action button to add a new task.",
-    "The clock app package is com.google.android.deskclock. To set an alarm, open the Alarm tab and tap the + button.",
-    "Chrome browser package is com.android.chrome. The URL bar is at the top of the screen.",
-    "The calendar app package is com.google.android.calendar. Tap the + button to add a new event.",
+# General navigation tips — always seeded into RAG
+_SEED_DOCS_GENERAL = [
     "To navigate between apps, press the home button or use the recent apps button. Swipe up on the home screen to open the app drawer.",
     "When a dialog box appears asking 'Do you want to quit?', tap CANCEL to stay in the app or OK to exit.",
     "Text fields (EditText) must be tapped to focus before typing. After typing, tap a Save or confirm button.",
     "If an app doesn't open with open_app, try pressing home first, then swiping up to open the app drawer, then tapping the app icon.",
 ]
 
+# Known app tips — only seeded if the app is actually installed
+_APP_TIPS: dict[str, str] = {
+    "todolist.scheduleplanner.dailyplanner.todo.reminders":
+        "The todo app package is todolist.scheduleplanner.dailyplanner.todo.reminders. Tap the + or floating action button to add a new task.",
+    "com.google.android.deskclock":
+        "The clock app package is com.google.android.deskclock. To set an alarm, open the Alarm tab and tap the + button.",
+    "com.android.chrome":
+        "Chrome browser package is com.android.chrome. The URL bar is at the top of the screen.",
+    "com.google.android.calendar":
+        "The calendar app package is com.google.android.calendar. Tap the + button to add a new event.",
+    "com.google.android.apps.messaging":
+        "The Messages app package is com.google.android.apps.messaging. Tap the compose button to start a new conversation.",
+    "com.google.android.contacts":
+        "The Contacts app package is com.google.android.contacts. Tap the + floating button to add a new contact.",
+    "com.google.android.dialer":
+        "The Phone/Dialer app package is com.google.android.dialer. Use the dialpad tab to make calls.",
+    "com.google.android.gm":
+        "Gmail package is com.google.android.gm. Tap the compose button (pencil icon) to write a new email.",
+    "com.google.android.apps.maps":
+        "Google Maps package is com.google.android.apps.maps. Tap the search bar to search for places.",
+    "com.android.settings":
+        "The Settings app package is com.android.settings. Navigate sections to modify device configuration.",
+    "com.google.android.apps.photos":
+        "Google Photos package is com.google.android.apps.photos. Photos are organized in the Photos tab, albums in the Library tab.",
+    "com.android.camera2":
+        "The Camera app package is com.android.camera2. Tap the shutter button to take a photo, swipe for video mode.",
+    "com.google.android.youtube":
+        "YouTube package is com.google.android.youtube. Use the search icon to find videos.",
+}
 
-def _setup_rag(enable_prism: bool) -> "MemShield | None":
+
+def _build_seed_docs(installed_apps: list[dict]) -> list[str]:
+    """Build seed docs from general tips + tips for installed apps."""
+    docs = list(_SEED_DOCS_GENERAL)
+    installed_pkgs = {a["package"] for a in installed_apps}
+
+    for pkg, tip in _APP_TIPS.items():
+        if pkg in installed_pkgs:
+            docs.append(tip)
+
+    # Add a summary doc listing all installed apps
+    if installed_apps:
+        app_list = ", ".join(a["package"] for a in installed_apps)
+        docs.append(f"Installed apps on this device: {app_list}")
+
+    return docs
+
+
+def _setup_rag(enable_prism: bool, installed_apps: list[dict] | None = None) -> "MemShield | None":
     """Create a persistent RAG knowledge base with MemShield defense.
 
     Mode is controlled by env vars:
@@ -485,9 +764,21 @@ def _setup_rag(enable_prism: bool) -> "MemShield | None":
             generator=_concat_generator if retrieval_defense else None,
         )
 
+        # Seed with dynamic docs based on discovered apps
+        seed_docs = _build_seed_docs(installed_apps or [])
         if collection.count() == 0:
-            ids = [f"kb_{i}" for i in range(len(_SEED_DOCS))]
-            shield.add_with_provenance(documents=_SEED_DOCS, ids=ids)
+            ids = [f"kb_{i}" for i in range(len(seed_docs))]
+            shield.add_with_provenance(documents=seed_docs, ids=ids)
+        else:
+            # Update the app list doc even if KB already exists (apps may change)
+            app_doc_id = "kb_installed_apps"
+            if installed_apps:
+                app_list = ", ".join(a["package"] for a in installed_apps)
+                doc = f"Installed apps on this device: {app_list}"
+                try:
+                    shield.add_with_provenance(documents=[doc], ids=[app_doc_id])
+                except Exception:
+                    pass  # ID already exists — fine
 
         mode = "lightweight"
         if retrieval_defense:
@@ -573,6 +864,14 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
     d.unlock()
     time.sleep(1)
 
+    # Discover installed apps so the agent knows what's available
+    installed_apps = _discover_apps(serial)
+    if installed_apps:
+        app_list = ", ".join(a["package"] for a in installed_apps)
+        print(f"  Apps: {len(installed_apps)} launchable ({app_list[:80]}...)")
+    else:
+        print(f"  {YELLOW}Apps: discovery failed — agent will rely on task hints{RESET}")
+
     # Set up PRISM client and defended device wrapper
     global _active_system_prompt, _conversation
     if enable_prism:
@@ -582,13 +881,18 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
         prism = NullPrismClient()
         _active_system_prompt = SYSTEM_PROMPT_UNDEFENDED
 
+    # Inject discovered apps into system prompt so agent knows what's available
+    if installed_apps:
+        app_lines = "\n".join(f"  - {a['package']}" for a in installed_apps)
+        _active_system_prompt += f"\n\nInstalled apps on this device:\n{app_lines}"
+
     # Initialize multi-turn conversation with system message
     _conversation = [{"role": "system", "content": _active_system_prompt}]
 
     dd = DefendedDevice(d, prism if enable_prism else None, serial)
 
-    # Set up RAG knowledge base
-    memshield = _setup_rag(enable_prism)
+    # Set up RAG knowledge base (seeded with discovered apps)
+    memshield = _setup_rag(enable_prism, installed_apps=installed_apps)
     if memshield:
         kb_count = memshield.collection.count() if memshield.collection else 0
         if enable_prism and memshield.config.enable_retrieval_defense:
@@ -617,12 +921,9 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
 
     ask = {"groq": ask_groq, "claude": ask_claude, "local": ask_local}[llm]
     action_history = ActionHistory()
+    progress = ProgressTracker()
     last_sig = None
-    
-    # Simple loop detection (same approach as OpenClaw's proven agent loop)
-    consecutive_no_change = 0
-    recent_actions: list[tuple[str, str]] = []  # (action, params_json)
-    
+
     for step in range(1, MAX_STEPS + 1):
         print(f"\n{BOLD}[Step {step}/{MAX_STEPS}]{RESET}")
 
@@ -638,6 +939,9 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
             logger.error(f"Context assembly failed: {e}")
             time.sleep(2)
             continue
+        # Inject app list into context (survives conversation compaction)
+        if installed_apps:
+            ctx.installed_apps = [a["package"] for a in installed_apps]
         last_sig = assembler.get_screen_sig(ctx)
 
         total_blocked = sum(ctx.blocked_counts.values())
@@ -652,11 +956,8 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
         if ctx.degraded_paths:
             print(f"  {YELLOW}DEGRADED: {', '.join(ctx.degraded_paths)} unavailable{RESET}")
 
-        # Track screen changes for loop detection
-        if not ctx.screen_changed:
-            consecutive_no_change += 1
-        else:
-            consecutive_no_change = 0
+        # ── Track screen state for progress detection ─────────────────────
+        progress.record_screen(ctx.ui_elements, ctx.screen_changed)
 
         # Try obvious actions first (saves an LLM call on dialog screens)
         obvious = check_obvious_actions(task, ctx.ui_elements, ctx.screen_changed)
@@ -670,6 +971,13 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
             _trim_conversation()
         else:
             prompt = ctx.to_prompt_dict()
+
+            # Inject stuck hint if progress tracker detects trouble
+            stuck_hint = progress.get_stuck_hint()
+            if stuck_hint:
+                prompt["progress_warning"] = stuck_hint
+                print(f"  {YELLOW}{stuck_hint}{RESET}")
+
             # Pass screenshot for multimodal LLMs (Claude)
             if ctx.screenshot_b64:
                 prompt["_screenshot_b64"] = ctx.screenshot_b64
@@ -678,43 +986,24 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
         action = dec.get("action", "fail")
         params = dec.get("params", {})
 
-        # ── Loop detection (same proven approach as OpenClaw) ──────────────
-        action_key = (action, json.dumps(params, sort_keys=True))
+        # ── Loop detection (hash-based with escalating thresholds) ────────
         is_loop = False
-
-        if action not in ("done", "fail") and len(recent_actions) >= 2:
-            # Same action repeated 3+ times consecutively → press back
-            consecutive = sum(1 for a in recent_actions[-3:] if a == action_key)
-            if consecutive >= 3:
-                print(f"  {YELLOW}LOOP: '{action}' repeated {consecutive}x → pressing back{RESET}")
+        if action not in ("done", "fail"):
+            escalation = progress.detect_loop(action, params)
+            if escalation == "home":
+                print(f"  {YELLOW}STUCK: no progress for {progress.steps_since_new_screen} steps → pressing home{RESET}")
+                action, params = "press", {"key": "home"}
+                is_loop = True
+            elif escalation == "back":
+                print(f"  {YELLOW}LOOP: repeated/stuck pattern detected → pressing back{RESET}")
                 action, params = "press", {"key": "back"}
                 is_loop = True
-            # Ping-pong: alternating between two actions (A-B-A-B)
-            elif len(recent_actions) >= 4:
-                last4 = recent_actions[-4:]
-                if last4[0] == last4[2] and last4[1] == last4[3] and last4[0] != last4[1]:
-                    print(f"  {YELLOW}LOOP: ping-pong detected → pressing back{RESET}")
-                    action, params = "press", {"key": "back"}
-                    is_loop = True
-            # Screen unchanged for 4+ steps → press back
-            if not is_loop and consecutive_no_change >= 4:
-                print(f"  {YELLOW}LOOP: screen unchanged {consecutive_no_change} steps → pressing back{RESET}")
-                action, params = "press", {"key": "back"}
-                is_loop = True
-            # Pressing back repeatedly → try home
-            if not is_loop and action == "press" and params.get("key") == "back":
-                back_count = sum(1 for a, p in recent_actions[-4:]
-                                 if a == "press" and '"back"' in p)
-                if back_count >= 3:
-                    print(f"  {YELLOW}LOOP: back {back_count}x → pressing home{RESET}")
-                    action, params = "press", {"key": "home"}
-                    is_loop = True
+            elif escalation == "warn":
+                # Don't override — let LLM try, but it already got the hint via progress_warning
+                pass
 
-        if not is_loop:
-            recent_actions.append(action_key)
-        # Keep history bounded
-        if len(recent_actions) > 10:
-            recent_actions = recent_actions[-10:]
+        # Record action (even overridden ones, so tracker sees the recovery attempt)
+        progress.record_action(action, params)
 
         print(f"  Thought: {dec.get('thought', '')}")
         print(f"  Action:  {action} {params}")
