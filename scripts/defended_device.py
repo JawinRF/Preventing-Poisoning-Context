@@ -460,16 +460,37 @@ class DefendedDevice:
                     if not self._verify_ui_integrity(target_text, target_desc, expected_pkg):
                         return "blocked_by_ui_integrity"
 
+                if "xy" in params:
+                    xy = params["xy"]
+                    if isinstance(xy, (list, tuple)) and len(xy) == 2:
+                        subprocess.run(
+                            ["adb", "-s", self._serial, "shell", "input", "tap",
+                             str(int(xy[0])), str(int(xy[1]))],
+                            timeout=3, capture_output=True,
+                        )
+                        time.sleep(0.4)
+                        return "ok"
+                    return f"bad xy: {xy}"
+                if "rid" in params:
+                    rid = params["rid"]
+                    el = self._d(resourceIdMatches=f".*/{rid}$")
+                    if el.exists(timeout=3):
+                        el.click()
+                        time.sleep(0.4)
+                        return "ok"
+                    return f"not found: rid={rid}"
                 if "text" in params:
                     el = self._d(text=params["text"])
                     if el.exists(timeout=3):
                         el.click()
+                        time.sleep(0.4)
                         return "ok"
                     return f"not found: text={params['text']}"
                 if "desc" in params:
                     el = self._d(description=params["desc"])
                     if el.exists(timeout=3):
                         el.click()
+                        time.sleep(0.4)
                         return "ok"
                     return f"not found: desc={params['desc']}"
                 if "class" in params:
@@ -477,6 +498,7 @@ class DefendedDevice:
                     el = self._d(className=f"android.widget.{cls}")
                     if el.exists(timeout=3):
                         el.click()
+                        time.sleep(0.4)
                         return "ok"
                     return f"not found: class={cls}"
 

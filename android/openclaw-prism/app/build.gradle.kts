@@ -104,6 +104,8 @@ android {
     aaptOptions {
         noCompress("onnx")
     }
+
+    sourceSets.getByName("main").assets.srcDir(layout.buildDirectory.dir("generated/prismAssets"))
 }
 
 dependencies {
@@ -141,6 +143,8 @@ dependencies {
 // --- www build automation ---
 val wwwProjectDir = file("$rootDir/www")
 val assetsWwwDir = file("$projectDir/src/main/assets/www")
+val prismModelDir = file("$rootDir/../../models/tinybert_poison_classifier_v3")
+val prismAssetsDir = layout.buildDirectory.dir("generated/prismAssets")
 
 val buildWww by tasks.registering(Exec::class) {
     description = "Build React UI (npm run build)"
@@ -164,8 +168,17 @@ val syncWwwAssets by tasks.registering(Sync::class) {
     into(assetsWwwDir)
 }
 
+val syncPrismTokenizerAsset by tasks.registering(Sync::class) {
+    description = "Copy TinyBERT v3 tokenizer into Android assets"
+    group = "build"
+    from(prismModelDir.resolve("tokenizer.json"))
+    into(prismAssetsDir)
+    rename { "tinybert_tokenizer.json" }
+}
+
 tasks.named("preBuild") {
     dependsOn(syncWwwAssets)
+    dependsOn(syncPrismTokenizerAsset)
 }
 
 detekt {

@@ -1,9 +1,9 @@
 """
 quantize_tinybert.py
 --------------------
-Applies INT8 dynamic quantization to the fine-tuned TinyBERT classifier.
+Applies INT8 dynamic quantization to the fine-tuned TinyBERT v3 classifier.
 Run AFTER training is complete. Produces a quantized model at:
-  models/tinybert_poison_classifier_v2_int8/
+  models/tinybert_poison_classifier_v3_int8/
 
 Validates that quantized model accuracy matches FP32 baseline before saving.
 """
@@ -18,8 +18,8 @@ from torch.utils.data import DataLoader, Dataset
 import pandas as pd
 
 # ── Config ────────────────────────────────────────────────────────────────────
-FP32_MODEL_PATH  = "models/tinybert_poison_classifier_v2"
-INT8_MODEL_PATH  = "models/tinybert_poison_classifier_v2_int8"
+FP32_MODEL_PATH  = "models/tinybert_poison_classifier_v3"
+INT8_MODEL_PATH  = "models/tinybert_poison_classifier_v3_int8"
 DATASET_PATH     = "data/prism_synthetic_dataset.json"   # Adjust to actual path
 ACCURACY_TOLERANCE = 0.005   # INT8 must be within 0.5% of FP32 accuracy
 BATCH_SIZE = 32

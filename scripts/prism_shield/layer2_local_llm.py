@@ -1,22 +1,33 @@
 # scripts/prism_shield/layer2_local_llm.py
 
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from .base import ValidationResult
 import os
+import numpy as np
+import onnxruntime as ort
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+from .base import ValidationResult
 
 try:
     from unicode_defense import normalize_unicode
 except ModuleNotFoundError:  # pragma: no cover
     from memshield_unicode_defense import normalize_unicode  # type: ignore[import]  # noqa: F401
 
-CLASSIFY_THRESHOLD = 0.45  # bias toward higher recall on poisoning
+DEFAULT_BLOCK_THRESH = float(os.getenv("PRISM_L2_BLOCK_THRESHOLD", "0.85"))
+UI_BLOCK_THRESH = float(os.getenv("PRISM_L2_UI_BLOCK_THRESHOLD", "0.70"))
+DEFAULT_ALLOW_THRESH = float(os.getenv("PRISM_L2_ALLOW_THRESHOLD", "0.35"))
+UI_ALLOW_THRESH = float(os.getenv("PRISM_L2_UI_ALLOW_THRESHOLD", "0.40"))
 
 class LocalLLMValidator:
     def __init__(self, model_path: str = "models/tinybert_poison_classifier_v3"):
          base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
          _FP32_PATH = os.path.join(base_dir, model_path)
+         _ONNX_PATH = os.path.join(
+             base_dir,
+             "android/openclaw-prism/app/src/main/assets",
+             "tinybert_prism.onnx",
+         )
          _INT8_PATH = os.path.join(base_dir, "models/tinybert_poison_classifier_v3_int8", "model_int8_scripted.pt")
          _INT8_TOKENIZER_PATH = os.path.join(base_dir, "models/tinybert_poison_classifier_v3_int8")
 
@@ -28,43 +39,70 @@ class LocalLLMValidator:
          else:
               raise ValueError(f"Model path does not exist: {_FP32_PATH}")
 
-         if os.path.exists(_INT8_PATH):
+         if os.path.exists(_ONNX_PATH):
+              # Shared ONNX Runtime path keeps host and Android aligned on the
+              # same quantized v3 artifact while still using the HF tokenizer.
+              self.model = ort.InferenceSession(_ONNX_PATH, providers=["CPUExecutionProvider"])
+              self._backend = "onnx"
+              self._is_scripted = False
+              self.device = "cpu"
+              print("[Layer2] Loaded shared ONNX Runtime model")
+         elif os.path.exists(_INT8_PATH):
               # TorchScript INT8 — fastest path, no Python class overhead
               self.model = torch.jit.load(_INT8_PATH, map_location="cpu")
+              self._backend = "torchscript"
               self._is_scripted = True
               self.device = "cpu"
-              print("[Layer3] Loaded INT8 TorchScript model")
+              print("[Layer2] Loaded INT8 TorchScript model")
          elif os.path.exists(_FP32_PATH):
               # Fallback to FP32 HuggingFace model if INT8 not yet built
               self.device = "cuda" if torch.cuda.is_available() else "cpu"
               self.model = AutoModelForSequenceClassification.from_pretrained(_FP32_PATH)
               self.model.to(self.device)
+              self._backend = "hf"
               self._is_scripted = False
-              print("[Layer3] WARNING: INT8 model not found, falling back to FP32")
+              print("[Layer2] WARNING: INT8 model not found, falling back to FP32")
          else:
               raise ValueError(f"Model path does not exist: {_FP32_PATH}")
               
-         self.model.eval()
+         if self._backend != "onnx":
+              self.model.eval()
 
     def evaluate(self, normalized_text: str, ingestion_path: str | None = None) -> ValidationResult:
         cleaned_text = normalize_unicode(normalized_text)
-        
-        inputs = self.tokenizer(
-            cleaned_text, return_tensors="pt",
-            truncation=True, max_length=128,
-            padding="max_length"     # fixed length = consistent latency, no dynamic padding cost
-        ).to(self.device)
+
+        # Training wraps every ui_accessibility sample in <hierarchy><node .../></hierarchy>.
+        # Bare button labels ("Send", "+") are OOD → garbage scores. Rewrap only for L2.
+        if ingestion_path == "ui_accessibility":
+            stripped = cleaned_text.strip()
+            if stripped and not stripped.startswith("<"):
+                safe = stripped.replace('"', "&quot;")
+                cleaned_text = (
+                    '<?xml version="1.0" encoding="UTF-8"?>\n<hierarchy rotation="0">\n'
+                    f'  <node index="0" class="android.widget.Button" text="{safe}" '
+                    'content-desc="" resource-id="com.example:id/button1" '
+                    'clickable="true" visible-to-user="true" bounds="[0,0][100,100]" />\n'
+                    '</hierarchy>'
+                )
 
         with torch.no_grad():
-            if self._is_scripted:
-                # TorchScript forward — pass tensors directly
-                logits = self.model(
-                    inputs["input_ids"],
-                    inputs["attention_mask"],
-                    inputs.get("token_type_ids")
-                )
+            if self._backend == "onnx":
+                logits = self._onnx_logits(cleaned_text)
             else:
-                logits = self.model(**inputs).logits
+                inputs = self.tokenizer(
+                    cleaned_text, return_tensors="pt",
+                    truncation=True, max_length=128,
+                    padding="max_length"     # fixed length = consistent latency, no dynamic padding cost
+                ).to(self.device)
+                if self._is_scripted:
+                    # TorchScript forward — pass tensors directly
+                    logits = self.model(
+                        inputs["input_ids"],
+                        inputs["attention_mask"],
+                        inputs.get("token_type_ids")
+                    )
+                else:
+                    logits = self.model(**inputs).logits
 
         # Extract logits tensor from whatever object the HF model / Traced model returned
         if hasattr(logits, "logits"):
@@ -81,23 +119,23 @@ class LocalLLMValidator:
              benign_prob = probs[0][0].item()
              malicious_prob = probs[0][1].item()
         else:
-             benign_prob = probs[0].item()
-             malicious_prob = probs[1].item()
+            benign_prob = probs[0].item()
+            malicious_prob = probs[1].item()
 
-        # UI text needs a higher threshold — benign Android labels like
-        # "Export Contacts" or "Forward SMS" push TinyBERT into the 0.3-0.6
-        # range. 0.70 blocks genuine injection while letting normal UI through.
-        BLOCK_THRESH     = 0.70 if ingestion_path == "ui_accessibility" else 0.85
-        ALLOW_THRESH     = 0.15
+        # TinyBERT v3 still places some benign short UI/action strings in the
+        # 0.3-0.4 band. Widen the allow band so low-confidence scores like
+        # "Hello" do not get escalated into a final BLOCK upstream.
+        block_thresh = UI_BLOCK_THRESH if ingestion_path == "ui_accessibility" else DEFAULT_BLOCK_THRESH
+        allow_thresh = UI_ALLOW_THRESH if ingestion_path == "ui_accessibility" else DEFAULT_ALLOW_THRESH
 
-        if malicious_prob >= BLOCK_THRESH:
+        if malicious_prob >= block_thresh:
             return ValidationResult(
                 verdict="BLOCK",
                 confidence=malicious_prob,
                 reason="Layer 2 Local Model identified prompt injection",
                 layer_triggered="Layer2-LocalLLM",
             )
-        elif malicious_prob <= ALLOW_THRESH:
+        elif malicious_prob <= allow_thresh:
             return ValidationResult(
                 verdict="ALLOW",
                 confidence=benign_prob,
@@ -111,3 +149,22 @@ class LocalLLMValidator:
                 reason="Layer 2 Local Model detected anomalous context but confidence is borderline.",
                 layer_triggered="Layer2-LocalLLM",
             )
+
+    def _onnx_logits(self, cleaned_text: str) -> torch.Tensor:
+        encoded = self.tokenizer(
+            cleaned_text,
+            return_tensors="np",
+            truncation=True,
+            max_length=128,
+            padding="max_length",
+        )
+        inputs = {
+            "input_ids": encoded["input_ids"].astype(np.int64),
+            "attention_mask": encoded["attention_mask"].astype(np.int64),
+            "token_type_ids": encoded.get(
+                "token_type_ids",
+                np.zeros_like(encoded["input_ids"], dtype=np.int64),
+            ).astype(np.int64),
+        }
+        logits = self.model.run(None, inputs)[0]
+        return torch.from_numpy(logits)

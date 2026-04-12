@@ -121,7 +121,7 @@ Reply with ONLY a single JSON object:
 
 Actions:
   open_app  {"package": "com.example.app"}
-  tap       {"text": "exact text"} or {"desc": "exact desc"} or {"class": "EditText"}
+  tap       {"idx": N} (STRONGLY PREFERRED — resolves to element's exact xy) or {"xy":[x,y]} or {"rid":"..."} or {"text":"..."} or {"desc":"..."} or {"class":"EditText"}
   type      {"text": "text to type"}  — clears field first, then types
   clear     {}                        — clears the focused text field
   swipe     {"direction": "up|down|left|right"}  — swipe up on home = open app drawer
@@ -132,8 +132,12 @@ Actions:
   fail      {"reason": "why"}
 
 Rules:
-- Only use text/desc values visible in screen elements
-- Check for input_field elements (name, hint fields) — tap to focus, then type
+- The screenshot has numbered circles drawn on every element: RED = clickable/button, BLUE = text input. The number inside = idx.
+- Each element in the list has idx, xy (center pixel), rid (resource-id), plus text/desc if any
+- Workflow: find target bubble in screenshot → read its number → output {"action":"tap","params":{"idx":N}}. System looks up xy for you.
+- NEVER pass xy manually — you will make mistakes. Always use idx.
+- To type in a field: tap the BLUE bubble (input_field:true) for that field first, then type
+- Use text/desc selectors only if xy is missing
 - When a WebContent element is present, use web_tap/web_type instead of tap/type to interact with web page elements
 - If screen_changed is false, your last action had no effect — try something different
 - NEVER repeat a type action if you already typed successfully in a previous step
@@ -163,7 +167,7 @@ Reply with ONLY a single JSON object:
 
 Actions:
   open_app  {"package": "todolist.scheduleplanner.dailyplanner.todo.reminders"}
-  tap       {"text": "exact text"} or {"desc": "exact desc"} or {"class": "EditText"}
+  tap       {"idx": N} (STRONGLY PREFERRED — resolves to element's exact xy) or {"xy":[x,y]} or {"rid":"..."} or {"text":"..."} or {"desc":"..."} or {"class":"EditText"}
   type      {"text": "text to type"}  — clears field first, then types
   clear     {}                        — clears the focused text field
   swipe     {"direction": "up|down|left|right"}  — swipe up on home = open app drawer
@@ -280,10 +284,10 @@ class ProgressTracker:
 
     # Thresholds (escalating response)
     WARN_REPEAT = 2       # same action 2x → warn LLM
-    BREAK_REPEAT = 3      # same action 3x → force different action
-    PINGPONG_WINDOW = 4   # A-B-A-B detection window
-    SCREEN_STUCK = 3      # same screen hash 3x → escalate
-    GLOBAL_NO_PROGRESS = 5  # 5 steps with no new screen → force home
+    BREAK_REPEAT = 4      # same action 4x → force different action
+    PINGPONG_WINDOW = 6   # A-B-A-B-A-B detection window
+    SCREEN_STUCK = 5      # same screen hash 5x → escalate
+    GLOBAL_NO_PROGRESS = 7  # 7 steps with no new screen → force home
 
     def __init__(self):
         self.action_hashes: list[str] = []      # ordered history of action hashes
@@ -370,7 +374,7 @@ class ProgressTracker:
             return "home"
 
         # 5. Consecutive no-change (screen_changed=false)
-        if self.consecutive_no_change >= 4:
+        if self.consecutive_no_change >= 6:
             return "back"
 
         # 6. Too many backs → home
@@ -1004,6 +1008,23 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
 
         # Record action (even overridden ones, so tracker sees the recovery attempt)
         progress.record_action(action, params)
+
+        # Resolve idx → xy using the current element list. Prevents xy hallucination.
+        if action == "tap" and "idx" in params:
+            try:
+                idx = int(params["idx"])
+                match = next((e for e in ctx.ui_elements if e.get("idx") == idx), None)
+                if match and match.get("xy"):
+                    params = {**params, "xy": match["xy"]}
+                    # carry text/desc for PRISM inspection context
+                    if match.get("text"):
+                        params["text"] = match["text"]
+                    elif match.get("desc"):
+                        params["desc"] = match["desc"]
+                else:
+                    print(f"  {YELLOW}idx {idx} has no xy in element list{RESET}")
+            except (ValueError, TypeError):
+                pass
 
         print(f"  Thought: {dec.get('thought', '')}")
         print(f"  Action:  {action} {params}")

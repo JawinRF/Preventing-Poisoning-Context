@@ -7,9 +7,9 @@ This repo implements a defense stack for Android mobile agents. The project now 
 
 The current defended-agent path is intentionally split:
 
-- **Observation path**: the agent sees the full Android screen so it can navigate reliably
-- **Action path**: taps and typed text are verified before execution
-- **Data paths**: notifications, clipboard, SMS, contacts, storage, and RAG are filtered before reaching the LLM
+- **Observation path**: the agent sees the full Android screen so it can navigate reliably. Screenshots are overlaid with numbered Set-of-Mark bubbles (red = clickable, blue = text input) so the LLM picks targets by `idx` instead of guessing coordinates.
+- **Action path**: taps and typed text are verified before execution. `tap` accepts `idx` (preferred — host resolves to element xy), `xy`, `rid`, `text`, `desc`, or `class`.
+- **Data paths**: notifications, clipboard, SMS, contacts, storage, and RAG are filtered before reaching the LLM.
 
 ## Current status
 
@@ -60,10 +60,25 @@ DefendedDevice
 
 Text-path filtering for untrusted data before it reaches the LLM:
 
-- Normalizer
-- Layer 1 heuristics
-- Layer 2 TinyBERT
-- Layer 3 DeBERTa
+- **Normalizer** — Unicode NFC, confusable character folding, zero-width stripping
+- **Layer 2 TinyBERT v3** — 44K-sample fine-tuned classifier, shared ONNX artifact with Android (`tinybert_prism.onnx`). For `ui_accessibility`, short inputs are wrapped in `<hierarchy><node .../></hierarchy>` to match training distribution
+- **Layer 3 DeBERTa** — `ProtectAI/deberta-v3-base-prompt-injection-v2` safety net
+
+The old Layer 1 regex heuristic stage was removed; TinyBERT v3 handles the same patterns with fewer false positives.
+
+**Configurable thresholds** (env vars):
+
+| Variable | Default | Scope |
+|---|---|---|
+| `PRISM_L2_BLOCK_THRESHOLD` | `0.85` | Default block threshold |
+| `PRISM_L2_UI_BLOCK_THRESHOLD` | `0.70` | `ui_accessibility` path |
+| `PRISM_L2_ALLOW_THRESHOLD` | `0.35` | Default allow band |
+| `PRISM_L2_UI_ALLOW_THRESHOLD` | `0.40` | `ui_accessibility` path |
+
+**QUARANTINE resolution** is path-dependent:
+
+- Incoming text (`notifications`, `clipboard`, ...): `QUARANTINE → BLOCK`
+- Agent's own output (`agent_output`): `QUARANTINE → ALLOW`
 
 Active filtered paths:
 
@@ -102,6 +117,17 @@ Optional full retrieval defense:
 - copy ratio
 - composite poison scorer + reranking
 - optional ProGRank perturbation instability
+
+## Agent observation + action
+
+Each step:
+
+1. `context_assembler.py` dumps the UI hierarchy via uiautomator2 and parses every element into `{idx, xy, rid, class, text?, desc?, input_field?}`. Clickable icon buttons with no label are kept.
+2. A screenshot is captured and overlaid with numbered circles at each element's `xy` (Set-of-Mark prompting). Red = clickable, blue = text input.
+3. The LLM reads the list + annotated screenshot and replies with `{"action":"tap","params":{"idx":N}}`. `agent_prism.py` resolves `idx → xy` from the element list before calling `DefendedDevice.execute`, so the LLM cannot hallucinate coordinates.
+4. `defended_device.py` runs PRISM + UI-integrity checks, then executes via `adb shell input tap` (for `xy`) or uiautomator2 selectors (for `rid`, `text`, `desc`).
+
+Loop / stuck detection escalates to `press back` then `press home` only after several consecutive no-progress steps.
 
 ## Runtime modes
 
@@ -215,10 +241,11 @@ scripts/
   openclaw_adapter/
     server.py                 # Python PRISM sidecar
   prism_shield/
-    pipeline.py               # PRISM text pipeline
-    layer1_heuristics.py
-    layer2_local_llm.py
-    layer3_deberta.py
+    pipeline.py               # PRISM text pipeline (Normalizer -> L2 TinyBERT -> L3 DeBERTa)
+    normalizer.py             # Unicode NFC + confusable + zero-width stripping
+    ui_extractor.py           # Flatten accessibility node dumps
+    layer2_local_llm.py       # TinyBERT v3, shared ONNX runtime, path-aware thresholds
+    layer3_deberta.py         # ProtectAI DeBERTa fallback
 
 android/
   openclaw-prism/
@@ -229,7 +256,8 @@ android/
         PrismNotificationListener.kt
         UiIntegrityChecker.kt
         ContentProviderReader.kt
-        OnnxClassifier.kt
+        OnnxClassifier.kt            # Uses shared tinybert_prism.onnx
+        BertWordPieceTokenizer.kt    # HF-compatible tokenizer (fixes hash-id drift)
 
 memshield/
   src/memshield/

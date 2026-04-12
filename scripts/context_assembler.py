@@ -34,6 +34,55 @@ _CDP_MAX_CHARS = 2000  # keep web content concise for prompt
 _SIDECAR_TIMEOUT_S = 5
 
 
+def _annotate_marks(pil_img, elements: list[dict]):
+    """Overlay numbered circles at each element's xy (Set-of-Mark prompting).
+
+    Clickables get red bubbles; text/labels get blue. LLM picks target by idx.
+    """
+    from PIL import ImageDraw, ImageFont
+    img = pil_img.convert("RGB").copy()
+    draw = ImageDraw.Draw(img, "RGBA")
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+    except Exception:
+        font = ImageFont.load_default()
+    seen: set[tuple[int, int]] = set()
+    for e in elements:
+        xy = e.get("xy")
+        if not xy:
+            continue
+        x, y = int(xy[0]), int(xy[1])
+        key = (x // 12, y // 12)  # dedupe near-identical positions
+        if key in seen:
+            continue
+        seen.add(key)
+        idx = e.get("idx", "?")
+        r = 18
+        is_input = e.get("input_field")
+        fill = (0, 128, 255, 220) if is_input else (220, 30, 30, 220)
+        draw.ellipse((x - r, y - r, x + r, y + r), fill=fill, outline=(255, 255, 255, 255), width=2)
+        label = str(idx)
+        try:
+            bbox = draw.textbbox((0, 0), label, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        except Exception:
+            tw, th = 10, 14
+        draw.text((x - tw / 2, y - th / 2 - 2), label, fill=(255, 255, 255), font=font)
+    return img
+
+
+def _bounds_center(bounds: str) -> list[int] | None:
+    """Parse '[x1,y1][x2,y2]' into [cx, cy]."""
+    if not bounds:
+        return None
+    try:
+        parts = bounds.replace("][", ",").strip("[]").split(",")
+        x1, y1, x2, y2 = (int(p) for p in parts)
+        return [(x1 + x2) // 2, (y1 + y2) // 2]
+    except (ValueError, IndexError):
+        return None
+
+
 # ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -202,8 +251,8 @@ class ContextAssembler:
         ctx.ui_elements, ui_warned = self._gather_ui()
         ctx.warned_counts["ui_accessibility"] = ui_warned
 
-        # 1b. Screenshot for multimodal LLMs (Claude)
-        ctx.screenshot_b64 = self._capture_screenshot()
+        # 1b. Screenshot for multimodal LLMs (Claude) — annotated with idx marks
+        ctx.screenshot_b64 = self._capture_screenshot(ctx.ui_elements)
 
         # Compute screen signature for change detection
         current_sig = self._sig(ctx.ui_elements)
@@ -431,17 +480,20 @@ class ContextAssembler:
 
     # ── 1b. Screenshot capture ────────────────────────────────────────────
 
-    def _capture_screenshot(self) -> str | None:
-        """Capture a JPEG screenshot and return it as a base64 string.
+    def _capture_screenshot(self, elements: list[dict] | None = None) -> str | None:
+        """Capture a JPEG screenshot with set-of-mark idx bubbles overlaid.
 
-        Used by multimodal LLMs (Claude) so they can SEE the screen,
-        not just read parsed element text.  Returns None on failure.
+        For each element with an ``xy`` center, draw a numbered circle so
+        the multimodal LLM can pick a target by idx instead of guessing
+        coordinates from raw pixels.  Returns None on failure.
         """
         import base64, io
         try:
-            pil_img = self.device.screenshot()  # returns PIL Image
+            pil_img = self.device.screenshot()
+            if elements:
+                pil_img = _annotate_marks(pil_img, elements)
             buf = io.BytesIO()
-            pil_img.save(buf, format="JPEG", quality=40)
+            pil_img.save(buf, format="JPEG", quality=50)
             return base64.b64encode(buf.getvalue()).decode("ascii")
         except Exception as exc:
             logger.warning(f"Screenshot capture failed: {exc}")
@@ -565,23 +617,33 @@ class ContextAssembler:
             selected = node.attrib.get("selected", "false") == "true"
             focused = node.attrib.get("focused", "false") == "true"
             hint = node.attrib.get("hint", "").strip()
+            rid_full = node.attrib.get("resource-id", "").strip()
+            rid = rid_full.split("/")[-1] if rid_full else ""
+            bounds = node.attrib.get("bounds", "")
+            xy = _bounds_center(bounds)
 
             if "EditText" in cls or "TextInputEditText" in cls:
                 e = {"class": cls, "input_field": True}
                 if text: e["text"] = text
                 if desc: e["desc"] = desc
                 if hint: e["hint"] = hint
+                if rid: e["rid"] = rid
+                if xy: e["xy"] = xy
                 if not enabled: e["disabled"] = True
                 if focused: e["focused"] = True
                 elems.append(e)
                 continue
 
-            if not text and not desc:
+            # Keep unlabeled clickables too (image buttons, FABs) — they only
+            # have resource-id or bounds. Agent can still tap them by rid/xy.
+            if not text and not desc and not (click and (rid or xy)):
                 continue
 
             e = {"class": cls}
             if text: e["text"] = text
             if desc: e["desc"] = desc
+            if rid: e["rid"] = rid
+            if xy: e["xy"] = xy
             if click: e["clickable"] = True
             if not enabled: e["disabled"] = True
             if selected: e["selected"] = True
@@ -596,6 +658,10 @@ class ContextAssembler:
                 sorted_elems.insert(0, e)
             else:
                 sorted_elems.append(e)
+
+        # Assign stable idx for this screen so agent can tap by index.
+        for i, e in enumerate(sorted_elems):
+            e["idx"] = i
 
         return sorted_elems
 

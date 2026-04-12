@@ -22,6 +22,7 @@ class OnnxClassifier(context: Context) {
 
     private val session: OrtSession
     private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
+    private val tokenizer = BertWordPieceTokenizer(context)
 
     init {
         val modelBytes = context.assets.open(MODEL_FILE).readBytes()
@@ -37,24 +38,8 @@ class OnnxClassifier(context: Context) {
         val isBlock: Boolean
     )
 
-    private fun tokenize(text: String): LongArray {
-        val tokens = text.lowercase()
-            .replace(Regex("[^a-z0-9\\s]"), " ")
-            .split(Regex("\\s+"))
-            .filter { it.isNotEmpty() }
-            .take(MAX_SEQ - 2)
-
-        val ids = LongArray(MAX_SEQ) { 0L }
-        ids[0] = 101L
-        tokens.forEachIndexed { i, token ->
-            ids[i + 1] = token.hashCode().and(Int.MAX_VALUE).toLong() % 30522L
-        }
-        ids[tokens.size + 1] = 102L
-        return ids
-    }
-
     fun classify(text: String): ClassifierResult {
-        val ids = tokenize(text)
+        val ids = tokenizer.encode(text, MAX_SEQ)
         val mask = LongArray(MAX_SEQ) { if (ids[it] != 0L) 1L else 0L }
         val types = LongArray(MAX_SEQ) { 0L }
 
