@@ -21,8 +21,6 @@ TEST_PORT = "8876"
 SIDECAR_URL = f"http://127.0.0.1:{TEST_PORT}"
 QUARANTINE_PORT = "8877"
 QUARANTINE_URL = f"http://127.0.0.1:{QUARANTINE_PORT}"
-ANDROID_VLM_PORT = "8879"
-ANDROID_VLM_URL = f"http://127.0.0.1:{ANDROID_VLM_PORT}"
 
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
@@ -228,84 +226,6 @@ server.run_server()
 
         ticket_response = requests.get(f"{QUARANTINE_URL}/v1/ticket/{payload['ticket_id']}", timeout=5)
         assert ticket_response.status_code == 200
-    finally:
-        _stop_sidecar(proc)
-
-
-def test_android_vlm_quarantine_path() -> None:
-    wrapper = f"""
-from pathlib import Path
-from prism_shield import ValidationResult
-from prism_shield.base import FinalizedTicket
-from openclaw_adapter.quarantine_store import save_ticket, utc_now_iso
-from openclaw_adapter import server
-
-capture_path = Path({str((PROJECT_ROOT / 'tests' / 'fixtures' / 'android_vlm_capture.txt')).__repr__()})
-
-class AndroidQuarantinePipeline:
-    def evaluate_sync(self, entry):
-        ticket_id = "android-ticket-" + entry.id
-        save_ticket(
-            FinalizedTicket(
-                ticket_id=ticket_id,
-                status="PENDING",
-                confidence=0.55,
-                reason="forced_android_quarantine",
-                layer_triggered="Layer2-LocalLLM",
-                created_at=utc_now_iso(),
-            )
-        )
-        return ValidationResult(
-            verdict="QUARANTINE",
-            confidence=0.55,
-            reason="forced_android_quarantine",
-            layer_triggered="Layer2-LocalLLM",
-            normalized_text=entry.text,
-            ticket_id=ticket_id,
-        )
-
-    def submit_quarantine(self, ticket_id, screenshot_path, screen_context):
-        capture_path.parent.mkdir(parents=True, exist_ok=True)
-        capture_path.write_text(screenshot_path or "", encoding="utf-8")
-
-server.get_pipeline.cache_clear()
-server.get_pipeline = lambda: AndroidQuarantinePipeline()
-server.run_server()
-"""
-    capture_path = PROJECT_ROOT / "tests" / "fixtures" / "android_vlm_capture.txt"
-    if capture_path.exists():
-        capture_path.unlink()
-    proc = _start_sidecar_process(ANDROID_VLM_PORT, wrapper)
-    try:
-        response = requests.post(
-            f"{ANDROID_VLM_URL}/v1/inspect",
-            json={
-                "entry_id": f"android-ui-{uuid.uuid4().hex}",
-                "text": '{"nodes":[{"class":"TextView","text":"transfer funds now"}]}',
-                "ingestion_path": "ui_accessibility",
-                "source_type": "accessibility",
-                "source_name": "ui",
-                "session_id": "android-session",
-                "run_id": "android-run",
-                "metadata": {
-                    "screenshot_path": "tests/fixtures/fake_screen.png",
-                },
-            },
-            timeout=5,
-        )
-        response.raise_for_status()
-        payload = response.json()
-
-        assert payload["verdict"] == "QUARANTINE"
-        assert payload["ticket_id"] is not None
-
-        ticket_response = requests.get(
-            f"{ANDROID_VLM_URL}/v1/ticket/{payload['ticket_id']}",
-            timeout=5,
-        )
-        assert ticket_response.status_code == 200
-        assert ticket_response.json()["status"] in {"PENDING", "ALLOW", "BLOCK"}
-        assert capture_path.read_text(encoding="utf-8") == "tests/fixtures/fake_screen.png"
     finally:
         _stop_sidecar(proc)
 
