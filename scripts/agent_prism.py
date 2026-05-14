@@ -453,12 +453,16 @@ def _should_retry(dec: dict) -> bool:
     return "json" in reason or "invalid" in reason
 
 
-def _raw_llm_call(llm_name: str) -> dict:
+def _raw_llm_call(llm_name: str, screenshot_b64: str | None = None) -> dict:
     """Call the selected LLM backend using the current _conversation as-is.
 
     Unlike ask_*(), this does NOT append a new user turn — callers must have
     already injected any corrective user message before calling here.
     Used exclusively for per-step retries.
+
+    screenshot_b64: when provided and llm_name == "claude", the corrective user
+    turn is sent as a multimodal message so Claude retains visual grounding.
+    Text-only backends ignore it.
     """
     try:
         if llm_name in ("groq", "deepseek"):
@@ -477,7 +481,18 @@ def _raw_llm_call(llm_name: str) -> dict:
             import anthropic
             client   = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
             messages = [m for m in _conversation if m["role"] != "system"]
-            msg      = client.messages.create(
+            # Re-attach screenshot to the corrective user turn so Claude retains
+            # visual grounding — the initial call stored text-only in _conversation.
+            if screenshot_b64 and messages and messages[-1]["role"] == "user":
+                correction_text = messages[-1]["content"]
+                messages[-1] = {"role": "user", "content": [
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/jpeg",
+                        "data": screenshot_b64,
+                    }},
+                    {"type": "text", "text": correction_text},
+                ]}
+            msg = client.messages.create(
                 model=CLAUDE_MODEL, max_tokens=300,
                 system=_active_system_prompt, messages=messages,
             )
@@ -500,13 +515,15 @@ def _raw_llm_call(llm_name: str) -> dict:
         return _fail(str(exc))
 
 
-def _with_retry(initial_dec: dict, llm_name: str) -> tuple[dict, int]:
+def _with_retry(initial_dec: dict, llm_name: str,
+                screenshot_b64: str | None = None) -> tuple[dict, int]:
     """If initial_dec is a parse/planning failure, retry up to _MAX_STEP_RETRIES.
 
     On each retry:
       1. Remove the bad assistant turn from _conversation (it's noise).
       2. Inject a targeted corrective user message.
-      3. Call _raw_llm_call() — no new user context, just the correction.
+      3. Call _raw_llm_call() — for Claude, re-attaches screenshot so visual
+         grounding is preserved across the correction turn.
 
     Returns (final_decision, retries_used).
     """
@@ -532,7 +549,7 @@ def _with_retry(initial_dec: dict, llm_name: str) -> tuple[dict, int]:
             _conversation.pop()
         _conversation.append({"role": "user", "content": correction})
 
-        dec = _raw_llm_call(llm_name)
+        dec = _raw_llm_call(llm_name, screenshot_b64=screenshot_b64)
 
     return dec, _MAX_STEP_RETRIES
 
@@ -1186,7 +1203,8 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
             if ctx.screenshot_b64:
                 prompt["_screenshot_b64"] = ctx.screenshot_b64
             dec = ask(prompt)
-            dec, _retries = _with_retry(dec, llm)
+            dec, _retries = _with_retry(dec, llm,
+                screenshot_b64=ctx.screenshot_b64 if llm == "claude" else None)
 
         action = dec.get("action", "fail")
         params = dec.get("params", {})
