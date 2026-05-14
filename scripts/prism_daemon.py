@@ -253,14 +253,21 @@ class CronScheduler(threading.Thread):
 class DeviceObserver(threading.Thread):
     """Polls the Android sidecar for new notifications/clipboard and PRISM-scans them.
 
+    On a BLOCK verdict the observer auto-queues a defensive task so the agent
+    can dismiss or investigate the threat without waiting for a user prompt.
+    Set auto_queue=False to disable action and keep it monitor-only.
+
     Skips silently when the device or PRISM sidecar is unreachable — the daemon
     continues running even without an emulator attached.
     """
 
-    def __init__(self, serial: str, stop_event: threading.Event):
+    def __init__(self, q, serial: str, stop_event: threading.Event,
+                 auto_queue: bool = True):
         super().__init__(name="DeviceObserver", daemon=True)
+        self.q             = q
         self.serial        = serial
         self.stop_event    = stop_event
+        self.auto_queue    = auto_queue
         self._seen_hashes: set[str] = set()   # dedup across ticks
         self._warned_down  = False             # suppress repeated "sidecar down" logs
 
@@ -331,6 +338,8 @@ class DeviceObserver(threading.Thread):
                 "%sBLOCKED%s [%s] %.0f%% — %s",
                 _RED, _RESET, label, confidence * 100, snippet,
             )
+            if self.auto_queue:
+                self._queue_defensive_task(path, label, snippet)
         elif verdict == "QUARANTINE":
             log.warning(
                 "%sQUARANTINE%s [%s] %.0f%% — %s",
@@ -338,6 +347,22 @@ class DeviceObserver(threading.Thread):
             )
         else:
             log.debug("ALLOW [%s] — %s", label, snippet)
+
+    def _queue_defensive_task(self, path: str, label: str, snippet: str) -> None:
+        if path == "clipboard":
+            task_text = (
+                "The clipboard contains content that was flagged as a prompt-injection "
+                "attack by PRISM. Clear the clipboard immediately."
+            )
+        else:
+            task_text = (
+                f"A notification from '{label}' was flagged as a prompt-injection "
+                f"attack by PRISM (snippet: \"{snippet[:60]}\"). "
+                "Open the notification shade and dismiss this notification."
+            )
+        tid = self.q.add_task(task_text, llm="claude", source="observer")
+        log.info("Auto-queued defensive task [%s] for blocked %s from %s",
+                 tid[:8], path, label)
 
     def _tick(self) -> None:
         ctx = self._fetch_context()
@@ -360,13 +385,15 @@ class DeviceObserver(threading.Thread):
 # ── PrismDaemon orchestrator ──────────────────────────────────────────────────
 
 class PrismDaemon:
-    def __init__(self, serial: str, enable_observer: bool = True):
+    def __init__(self, serial: str, enable_observer: bool = True,
+                 auto_queue: bool = True):
         # Import here so the module is importable without task_queue on sys.path
         sys.path.insert(0, _HERE)
         from task_queue import TaskQueue
         self.q                = TaskQueue()
         self.serial           = serial
         self.enable_observer  = enable_observer
+        self.auto_queue       = auto_queue
         self._stop            = threading.Event()
         self._threads: list[threading.Thread] = []
 
@@ -378,7 +405,10 @@ class PrismDaemon:
             CronScheduler(self.q, self._stop),
         ]
         if self.enable_observer:
-            self._threads.append(DeviceObserver(self.serial, self._stop))
+            self._threads.append(
+                DeviceObserver(self.q, self.serial, self._stop,
+                               auto_queue=self.auto_queue)
+            )
 
         for t in self._threads:
             t.start()
@@ -409,7 +439,11 @@ def cmd_run(args) -> None:
     """Run in the foreground (blocks until Ctrl-C)."""
     _setup_logging(foreground=True)
     log.info("Starting PRISM daemon (foreground, PID %d)", os.getpid())
-    daemon = PrismDaemon(args.serial, enable_observer=not args.no_observer)
+    daemon = PrismDaemon(
+        args.serial,
+        enable_observer=not args.no_observer,
+        auto_queue=not args.no_auto_queue,
+    )
     daemon.start()
     daemon.wait()
 
@@ -425,6 +459,8 @@ def cmd_start(args) -> None:
     cmd = [sys.executable, __file__, "run", "--serial", args.serial]
     if args.no_observer:
         cmd.append("--no-observer")
+    if args.no_auto_queue:
+        cmd.append("--no-auto-queue")
 
     os.makedirs(os.path.dirname(_LOG), exist_ok=True)
     log_file = open(_LOG, "a")
@@ -513,8 +549,10 @@ commands:
     p.add_argument("command", choices=["run", "start", "stop", "status"])
     p.add_argument("--serial",      default=_SERIAL,
                    help="Android emulator serial (default: %(default)s)")
-    p.add_argument("--no-observer", action="store_true",
+    p.add_argument("--no-observer",   action="store_true",
                    help="Disable the DeviceObserver thread (no emulator available)")
+    p.add_argument("--no-auto-queue", action="store_true",
+                   help="Observer monitors only — do not auto-queue defensive tasks on BLOCK")
 
     a = p.parse_args()
 
