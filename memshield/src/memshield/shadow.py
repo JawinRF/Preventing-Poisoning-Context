@@ -31,17 +31,42 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ShadowEntry:
-    """A single shadow memory entry."""
+    """A single shadow memory entry.
+
+    Corroboration semantics (PROVE-aligned):
+      A corroboration is recorded as a (source_class, source_id) pair.
+      Only DISTINCT pairs count toward promotion — repeated observations
+      from the same source do not raise trust. This closes MINJA-style
+      self-reinforcing memory poisoning where one attacker plants the same
+      content N times under the same source.
+
+      `corroborations` is the canonical list (set-of-tuples serialised).
+      `corroboration_count` is kept as a derived property for backward
+      compatibility with old JSONL rows; on load we recompute from
+      `corroborations` when present.
+    """
     entry_id: str
     text: str
     source_query: str              # query that generated this content
     generator: str                 # which model/pipeline produced it
     created_ts: float              # epoch seconds
     ttl_seconds: float             # time-to-live
-    corroboration_count: int = 0   # how many source docs support this
-    corroboration_required: int = 2  # minimum to promote
-    promoted: bool = False         # True once corroborated and moved to primary
-    authority: float = 0.20        # low authority by default (synthetic)
+
+    # Legacy counter — DEPRECATED; preserved for old rows. Use len(corroborations).
+    corroboration_count: int = 0
+    corroboration_required: int = 2  # minimum DISTINCT (class, id) pairs to promote
+
+    # NEW (PROVE): list of (source_class, source_id) tuples — distinct pairs.
+    # Serialised as a list of [str, str] for JSONL friendliness.
+    corroborations: list[tuple[str, str]] = field(default_factory=list)
+
+    # NEW (PROVE): parent chunk hashes — for lineage reconstruction at
+    # promotion time. The promoted cap_set is the intersection of parent
+    # caps; this list lets the audit trail reconstruct that derivation.
+    parents: list[str] = field(default_factory=list)
+
+    promoted: bool = False
+    authority: float = 0.20        # legacy heuristic field — not load-bearing post-PROVE
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -49,14 +74,35 @@ class ShadowEntry:
         return time.time() > (self.created_ts + self.ttl_seconds)
 
     @property
+    def distinct_corroboration_count(self) -> int:
+        """The PROVE-correct count: distinct (class, id) pairs."""
+        # corroborations is the authoritative source; fall back to the
+        # legacy counter for entries written before this field existed.
+        if self.corroborations:
+            return len({tuple(c) for c in self.corroborations})
+        return self.corroboration_count
+
+    @property
     def is_corroborated(self) -> bool:
-        return self.corroboration_count >= self.corroboration_required
+        return self.distinct_corroboration_count >= self.corroboration_required
+
+    def has_corroboration(self, source_class: str, source_id: str) -> bool:
+        """True iff this (class, id) pair already corroborates this entry."""
+        target = (source_class, source_id)
+        return any(tuple(c) == target for c in self.corroborations)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        # tuples don't round-trip JSON; coerce to lists
+        d["corroborations"] = [list(c) for c in self.corroborations]
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> ShadowEntry:
+        # Restore tuples from list-of-list serialisation
+        if "corroborations" in d and d["corroborations"]:
+            d = dict(d)
+            d["corroborations"] = [tuple(c) for c in d["corroborations"]]
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
@@ -101,8 +147,13 @@ class ShadowMemory:
         ttl_hours: float | None = None,
         authority: float = 0.20,
         metadata: dict[str, Any] | None = None,
+        parents: list[str] | None = None,
     ) -> str:
-        """Add a synthetic entry to shadow memory. Returns entry_id."""
+        """Add a synthetic entry to shadow memory. Returns entry_id.
+
+        `parents` is the list of parent chunk hashes (PROVE lineage). It
+        flows through to the promotion-time cap_set intersection.
+        """
         entry_id = str(uuid.uuid4())[:12]
         entry = ShadowEntry(
             entry_id=entry_id,
@@ -114,24 +165,59 @@ class ShadowMemory:
             corroboration_required=self._corr_required,
             authority=authority,
             metadata=metadata or {},
+            parents=parents or [],
         )
         self._entries[entry_id] = entry
         self._append(entry)
         logger.debug(f"Shadow entry added: {entry_id} (TTL={entry.ttl_seconds/3600:.1f}h)")
         return entry_id
 
-    def corroborate(self, entry_id: str) -> ShadowEntry | None:
-        """Increment corroboration count. Returns updated entry or None."""
+    def corroborate(
+        self,
+        entry_id: str,
+        source_class: str | None = None,
+        source_id: str | None = None,
+    ) -> ShadowEntry | None:
+        """Record a corroboration from a specific (source_class, source_id).
+
+        PROVE semantics: only DISTINCT (class, id) pairs raise trust.
+        Repeated corroboration from the same source is a no-op — this is
+        the central protection against MINJA-style self-poisoning (where
+        an attacker plants identical content under one source N times).
+
+        Legacy callers that pass no source identifiers still get the old
+        increment-counter behaviour but with a stern warning logged; this
+        path will be removed in a future cleanup.
+        """
         entry = self._entries.get(entry_id)
         if not entry:
             return None
         if entry.is_expired:
             logger.debug(f"Cannot corroborate expired entry {entry_id}")
             return entry
-        entry.corroboration_count += 1
+
+        if source_class is None or source_id is None:
+            logger.warning(
+                "shadow.corroborate(%s) called without (source_class, source_id) — "
+                "legacy path, does not enforce distinct-source rule.",
+                entry_id,
+            )
+            entry.corroboration_count += 1
+        else:
+            if entry.has_corroboration(source_class, source_id):
+                logger.debug(
+                    "Duplicate corroboration from %s/%s ignored for entry %s",
+                    source_class, source_id, entry_id,
+                )
+                return entry
+            entry.corroborations.append((source_class, source_id))
+
         if entry.is_corroborated and not entry.promoted:
             entry.authority = min(0.70, entry.authority + 0.30)
-            logger.info(f"Shadow entry {entry_id} corroborated ({entry.corroboration_count}x) — authority raised to {entry.authority:.2f}")
+            logger.info(
+                "Shadow entry %s corroborated (distinct=%d) — authority %.2f",
+                entry_id, entry.distinct_corroboration_count, entry.authority,
+            )
         self._persist()
         return entry
 
