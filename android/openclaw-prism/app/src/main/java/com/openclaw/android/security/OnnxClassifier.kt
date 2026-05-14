@@ -76,6 +76,8 @@ class OnnxClassifier(context: Context) {
 
     fun close() {
         session.close()
-        env.close()
+        // Do not close OrtEnvironment — it is a shared singleton returned by
+        // OrtEnvironment.getEnvironment(). Closing it here would break every
+        // other OnnxClassifier instance still in use (e.g. MemShield + A11y service).
     }
 }

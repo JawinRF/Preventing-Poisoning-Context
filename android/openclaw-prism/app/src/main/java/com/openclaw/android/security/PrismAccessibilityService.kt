@@ -55,19 +55,24 @@ class PrismAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val root = rootInActiveWindow ?: return
         scope.launch {
             try {
+                // captureScreenContext() acquires its own window root internally.
                 val screenCtx = bridge.captureScreenContext() ?: return@launch
                 val payload = bridge.buildInspectPayload(screenCtx)
                 val rawText = payload.optString("text", "")
                 if (rawText.isBlank()) return@launch
 
                 val norm = Normalizer.normalize(rawText)
-                // Layer 1 remains telemetry-only on Android; Layer 2 decides.
                 val l1 = PrismDetector.scan(norm.text)
                 val l2Prob = classifier?.classify(norm.text)?.maliciousProb ?: 0.0f
-                val verdict = if (l2Prob >= 0.70f) "BLOCK" else "ALLOW"
+                // Combined L1+L2 gate — mirrors the host-sidecar blocking logic.
+                val verdict = when {
+                    l2Prob >= 0.70f -> "BLOCK"
+                    l1.verdict == PrismDetector.Verdict.BLOCK && l2Prob >= 0.30f -> "BLOCK"
+                    l1.score >= 0.80f -> "BLOCK"
+                    else -> "ALLOW"
+                }
 
                 MemShieldDb.get(this@PrismAccessibilityService).auditDao().insert(
                     AuditEntry(
@@ -81,8 +86,6 @@ class PrismAccessibilityService : AccessibilityService() {
                 )
             } catch (_: Exception) {
                 // Service must not crash on bad node trees
-            } finally {
-                root.recycle()
             }
         }
     }

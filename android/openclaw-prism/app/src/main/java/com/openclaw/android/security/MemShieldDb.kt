@@ -124,7 +124,10 @@ class MemShield(private val context: Context) {
             val normalized = Normalizer.normalize(chunk.content).text
             val l1 = PrismDetector.scan(normalized)
             val l2Prob = classifier?.classify(normalized)?.maliciousProb ?: 0.0f
-            if (l2Prob >= 0.70f) {
+            val blocked = l2Prob >= 0.70f ||
+                (l1.verdict == PrismDetector.Verdict.BLOCK && l2Prob >= 0.30f) ||
+                l1.score >= 0.80f
+            if (blocked) {
                 db.chunkDao().updateVerdict(chunk.id, "BLOCK")
                 db.auditDao().insert(
                     AuditEntry(

@@ -40,7 +40,8 @@ import org.json.JSONObject
  *   POST /v1/inspect        — Normalization + local Layer 2 + optional host deep scan
  *   POST /v1/guard          — PII Guard on outgoing agent actions
  *   POST /v1/ui-integrity   — OS-level tap integrity check (replaces VLM visual grounding)
- *   GET  /v1/context        — Unified device context (notifications, clipboard, SMS, contacts, calendar)
+ *   GET  /v1/context        — Unified PRISM-scanned device context (notifications, clipboard, SMS, contacts, calendar)
+ *   GET  /v1/audit          — Recent on-device audit log (query param: limit, default 20)
  *   GET  /v1/status         — Health check + blocked count
  */
 class OpenClawService : Service() {
@@ -109,6 +110,9 @@ class OpenClawService : Service() {
                     "/v1/guard" -> svc.handleGuard(body)
                     "/v1/ui-integrity" -> svc.handleUiIntegrity(body)
                     "/v1/context" -> svc.handleContext()
+                    "/v1/audit" -> kotlinx.coroutines.runBlocking {
+                        svc.handleAudit(session.parameters["limit"]?.firstOrNull())
+                    }
                     "/v1/status" -> kotlinx.coroutines.runBlocking { svc.handleStatus() }
                     "/health" -> """{"status":"ok","sidecar":"android","port":$SIDECAR_PORT}"""
                     else -> """{"error":"unknown endpoint"}"""
@@ -159,11 +163,25 @@ class OpenClawService : Service() {
         val confidence: Double
         val reason: String
 
+        val l1Block = l1.verdict == PrismDetector.Verdict.BLOCK
+
         if (l2Prob >= 0.70f) {
             finalVerdict = "BLOCK"
             layerTriggered = "Layer2-ONNX"
             confidence = l2Prob.toDouble()
             reason = "Layer 2 ONNX identified prompt injection"
+        } else if (l1Block && l2Prob >= 0.30f) {
+            // L1 heuristic + moderate L2 agreement — combined gate
+            finalVerdict = "BLOCK"
+            layerTriggered = "Layer1+2-Combined"
+            confidence = ((l1.score + l2Prob) / 2).toDouble()
+            reason = "L1 heuristic + L2 ONNX combined: ${l1.matchedRules.joinToString()}"
+        } else if (l1.score >= 0.80f) {
+            // High-confidence heuristic alone (≥2 heavy categories matched)
+            finalVerdict = "BLOCK"
+            layerTriggered = "Layer1-HighConf"
+            confidence = l1.score.toDouble()
+            reason = "High-confidence heuristic: ${l1.matchedRules.joinToString()}"
         } else if (hostDeepScan != null && hostDeepScan.verdict == "BLOCK") {
             finalVerdict = "BLOCK"
             layerTriggered = hostDeepScan.layerTriggered
@@ -264,9 +282,40 @@ class OpenClawService : Service() {
         return a11y.uiIntegrity.check(targetText, targetDesc, expectedPkg).toString()
     }
 
-    // GET /v1/context — Unified device context for the Python agent
+    // GET /v1/context — Unified device context for the Python agent.
+    // All user-readable text fields are PRISM-scanned before inclusion.
+    // Poisoned fields are redacted with [PRISM_BLOCKED] rather than silently dropped.
     private fun handleContext(): String {
         val result = JSONObject()
+        var contextBlockedCount = 0
+
+        // Scan a text field and return it redacted if poisoned.
+        // Audit entries are written asynchronously so this stays synchronous.
+        fun scanField(text: String, path: String): String {
+            if (text.isBlank()) return text
+            val norm = Normalizer.normalize(text)
+            val l1 = PrismDetector.scan(norm.text)
+            val l2Prob = classifier?.classify(norm.text)?.maliciousProb ?: 0.0f
+            val l1Block = l1.verdict == PrismDetector.Verdict.BLOCK
+            val blocked = l2Prob >= 0.70f || (l1Block && l2Prob >= 0.30f) || l1.score >= 0.80f
+            if (blocked) {
+                contextBlockedCount++
+                serviceScope.launch {
+                    MemShieldDb.get(this@OpenClawService).auditDao().insert(
+                        AuditEntry(
+                            path = path,
+                            snippet = norm.text.take(120),
+                            verdict = "BLOCK",
+                            layer1Score = l1.score,
+                            layer2Prob = l2Prob,
+                            matchedRules = l1.matchedRules.joinToString(",")
+                        )
+                    )
+                }
+                return "[PRISM_BLOCKED]"
+            }
+            return text
+        }
 
         // Notifications — from PrismNotificationListener singleton
         val listener = PrismNotificationListener.instance
@@ -276,8 +325,8 @@ class OpenClawService : Service() {
                 notifArray.put(JSONObject().apply {
                     put("id", n.id)
                     put("package", n.packageName)
-                    put("title", n.title)
-                    put("text", n.text)
+                    put("title", scanField(n.title, "notification_context"))
+                    put("text", scanField(n.text, "notification_context"))
                     put("posted_time", n.postedTime)
                 })
             }
@@ -287,12 +336,12 @@ class OpenClawService : Service() {
             result.put("notifications_error", "NotificationListenerService not active")
         }
 
-        // Clipboard — read directly from system service
-        val clipText = try {
+        // Clipboard
+        val rawClip = try {
             val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
             clipboard.primaryClip?.getItemAt(0)?.getText()?.toString() ?: ""
         } catch (_: Exception) { "" }
-        result.put("clipboard", clipText)
+        result.put("clipboard", scanField(rawClip, "clipboard_context"))
 
         // SMS, Contacts, Calendar — from ContentProviderReader
         val reader = PrismNotificationListener.instance?.getContentReader()
@@ -302,8 +351,10 @@ class OpenClawService : Service() {
             val smsArray = org.json.JSONArray()
             reader.getSmsMessages(limit = 20).forEach { m ->
                 smsArray.put(JSONObject().apply {
-                    put("id", m.id); put("address", m.address)
-                    put("body", m.body); put("date", m.date)
+                    put("id", m.id)
+                    put("address", m.address)
+                    put("body", scanField(m.body, "sms_context"))
+                    put("date", m.date)
                 })
             }
             result.put("sms", smsArray)
@@ -316,7 +367,9 @@ class OpenClawService : Service() {
             val contactsArray = org.json.JSONArray()
             reader.getContacts(limit = 20).forEach { c ->
                 contactsArray.put(JSONObject().apply {
-                    put("id", c.id); put("name", c.name); put("note", c.note)
+                    put("id", c.id)
+                    put("name", c.name)
+                    put("note", scanField(c.note, "contacts_context"))
                 })
             }
             result.put("contacts", contactsArray)
@@ -329,9 +382,11 @@ class OpenClawService : Service() {
             val calendarArray = org.json.JSONArray()
             reader.getCalendarEvents(limit = 20).forEach { ev ->
                 calendarArray.put(JSONObject().apply {
-                    put("id", ev.id); put("title", ev.title)
-                    put("description", ev.description)
-                    put("start_time", ev.startTime); put("end_time", ev.endTime)
+                    put("id", ev.id)
+                    put("title", scanField(ev.title, "calendar_context"))
+                    put("description", scanField(ev.description, "calendar_context"))
+                    put("start_time", ev.startTime)
+                    put("end_time", ev.endTime)
                 })
             }
             result.put("calendar", calendarArray)
@@ -340,7 +395,31 @@ class OpenClawService : Service() {
             result.put("calendar_error", e.message ?: "unknown")
         }
 
+        result.put("prism_context_blocked", contextBlockedCount)
         return result.toString()
+    }
+
+    // GET /v1/audit?limit=N — recent on-device audit log for Python daemon visibility
+    private suspend fun handleAudit(limitStr: String?): String {
+        val limit = limitStr?.toIntOrNull()?.coerceIn(1, 200) ?: 20
+        val entries = MemShieldDb.get(this).auditDao().getRecent().take(limit)
+        val arr = org.json.JSONArray()
+        entries.forEach { e ->
+            arr.put(JSONObject().apply {
+                put("id", e.id)
+                put("path", e.path)
+                put("snippet", e.snippet)
+                put("verdict", e.verdict)
+                put("layer1_score", e.layer1Score)
+                put("layer2_prob", e.layer2Prob)
+                put("matched_rules", e.matchedRules)
+                put("timestamp", e.timestamp)
+            })
+        }
+        return JSONObject().apply {
+            put("entries", arr)
+            put("count", entries.size)
+        }.toString()
     }
 
     // ── Clipboard Hook ────────────────────────────────────────────────────────
