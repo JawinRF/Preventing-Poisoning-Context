@@ -92,6 +92,26 @@ RESET  = "\033[0m"
 _last_request_time = 0
 _request_min_interval = 0.2
 
+# ── Per-step retry (openclaw pattern) ────────────────────────────────────────
+_MAX_STEP_RETRIES = 2
+
+_JSON_CORRECTION = (
+    "Your previous response was not valid JSON. "
+    "You MUST reply with ONLY a raw JSON object and nothing else — no markdown, "
+    "no explanation, no prefix. Example: "
+    '{"thought": "I see the Alarm tab", "action": "tap", "params": {"text": "Alarm"}}'
+)
+
+_PLANNING_CORRECTION = (
+    "Stop describing what you will do. Execute immediately. "
+    "Reply with ONLY a JSON action object right now — no preamble."
+)
+
+_PLANNING_PHRASES = ("i will ", "i'll ", "i should ", "let me ", "next i ", "to do this ", "first i ")
+
+# ── Trajectory logging (openclaw pattern) ────────────────────────────────────
+_TRAJECTORY_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "agent_trajectory.jsonl")
+
 # ── System Prompt ─────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
@@ -400,6 +420,121 @@ class ProgressTracker:
             return (f"WARNING: Screen unchanged for {self.consecutive_no_change} steps. "
                     f"Your actions are having no effect. Try something different.")
         return None
+
+
+# ── Trajectory logging ───────────────────────────────────────────────────────
+
+def _log_trajectory(event: dict) -> None:
+    """Append a step event to data/agent_trajectory.jsonl (best-effort)."""
+    try:
+        os.makedirs(os.path.dirname(_TRAJECTORY_PATH), exist_ok=True)
+        with open(_TRAJECTORY_PATH, "a") as f:
+            f.write(json.dumps({"ts": time.time(), **event}) + "\n")
+    except Exception:
+        pass
+
+
+# ── Per-step retry helpers (openclaw pattern) ─────────────────────────────────
+
+def _is_planning_only(text: str) -> bool:
+    """True if LLM replied with a natural-language plan instead of a JSON action."""
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        return False
+    lower = stripped.lower()
+    return any(p in lower for p in _PLANNING_PHRASES)
+
+
+def _should_retry(dec: dict) -> bool:
+    """True if the decision is a retryable LLM-side failure (parse or planning)."""
+    if dec.get("action") != "fail":
+        return False
+    reason = dec.get("params", {}).get("reason", "").lower()
+    return "json" in reason or "invalid" in reason
+
+
+def _raw_llm_call(llm_name: str) -> dict:
+    """Call the selected LLM backend using the current _conversation as-is.
+
+    Unlike ask_*(), this does NOT append a new user turn — callers must have
+    already injected any corrective user message before calling here.
+    Used exclusively for per-step retries.
+    """
+    try:
+        if llm_name in ("groq", "deepseek"):
+            api_url = GROQ_API if llm_name == "groq" else DEEPSEEK_API
+            model   = GROQ_MODEL if llm_name == "groq" else DEEPSEEK_MODEL
+            key_env = "GROQ_API_KEY" if llm_name == "groq" else "DEEPSEEK_API_KEY"
+            payload = {"model": model, "messages": list(_conversation),
+                       "temperature": 0.1, "max_tokens": 300}
+            headers = {"Authorization": f"Bearer {os.environ.get(key_env, '')}",
+                       "Content-Type": "application/json"}
+            r = requests.post(api_url, json=payload, headers=headers, timeout=30)
+            r.raise_for_status()
+            raw = r.json()["choices"][0]["message"]["content"].strip()
+
+        elif llm_name == "claude":
+            import anthropic
+            client   = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+            messages = [m for m in _conversation if m["role"] != "system"]
+            msg      = client.messages.create(
+                model=CLAUDE_MODEL, max_tokens=300,
+                system=_active_system_prompt, messages=messages,
+            )
+            raw = msg.content[0].text.strip()
+
+        elif llm_name == "local":
+            payload = {"model": LOCAL_MODEL, "messages": list(_conversation),
+                       "stream": False, "options": {"temperature": 0.1, "num_predict": 300}}
+            r = requests.post(OLLAMA_URL, json=payload, timeout=60)
+            r.raise_for_status()
+            raw = r.json()["message"]["content"].strip()
+
+        else:
+            return _fail("unknown llm for retry")
+
+        _conversation.append({"role": "assistant", "content": raw})
+        return _parse_json(raw)
+
+    except Exception as exc:
+        return _fail(str(exc))
+
+
+def _with_retry(initial_dec: dict, llm_name: str) -> tuple[dict, int]:
+    """If initial_dec is a parse/planning failure, retry up to _MAX_STEP_RETRIES.
+
+    On each retry:
+      1. Remove the bad assistant turn from _conversation (it's noise).
+      2. Inject a targeted corrective user message.
+      3. Call _raw_llm_call() — no new user context, just the correction.
+
+    Returns (final_decision, retries_used).
+    """
+    dec = initial_dec
+    for attempt in range(_MAX_STEP_RETRIES):
+        if not _should_retry(dec):
+            return dec, attempt
+
+        # Diagnose failure type from the last assistant message
+        last_asst = next(
+            (m["content"] for m in reversed(_conversation) if m["role"] == "assistant"),
+            "",
+        )
+        is_planning = _is_planning_only(last_asst)
+        correction  = _PLANNING_CORRECTION if is_planning else _JSON_CORRECTION
+
+        tag = "planning-only" if is_planning else "json-parse-fail"
+        logger.info("Step retry %d/%d (%s)", attempt + 1, _MAX_STEP_RETRIES, tag)
+        print(f"  {YELLOW}[Retry {attempt + 1}/{_MAX_STEP_RETRIES}] {tag} — correcting{RESET}")
+
+        # Pop the bad assistant turn, push the correction as a new user message
+        if _conversation and _conversation[-1]["role"] == "assistant":
+            _conversation.pop()
+        _conversation.append({"role": "user", "content": correction})
+
+        dec = _raw_llm_call(llm_name)
+
+    return dec, _MAX_STEP_RETRIES
 
 
 def ask_groq(prompt_dict: dict) -> dict:
@@ -992,6 +1127,8 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
     last_sig = None
 
     for step in range(1, MAX_STEPS + 1):
+        _step_start = time.time()
+        _retries = 0
         print(f"\n{BOLD}[Step {step}/{MAX_STEPS}]{RESET}")
 
         # ── Assemble filtered context ──
@@ -1049,6 +1186,7 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
             if ctx.screenshot_b64:
                 prompt["_screenshot_b64"] = ctx.screenshot_b64
             dec = ask(prompt)
+            dec, _retries = _with_retry(dec, llm)
 
         action = dec.get("action", "fail")
         params = dec.get("params", {})
@@ -1103,6 +1241,18 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
 
         result = dd.execute(action, params)
         print(f"  Result:  {result}")
+
+        _log_trajectory({
+            "session": prism.session_id,
+            "task": task,
+            "step": step,
+            "action": action,
+            "params": {k: v for k, v in params.items() if k != "xy"},
+            "result": result,
+            "prism_blocked": total_blocked,
+            "llm_retries": _retries,
+            "step_ms": round((time.time() - _step_start) * 1000),
+        })
 
         # Record action + result for LLM context
         action_history.record(action, params, result)
