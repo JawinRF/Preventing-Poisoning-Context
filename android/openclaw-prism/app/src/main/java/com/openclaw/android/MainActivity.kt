@@ -7,7 +7,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.content.res.ColorStateList
+import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Bundle
 import android.view.Gravity
@@ -25,9 +25,13 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.openclaw.android.databinding.ActivityMainBinding
+import com.openclaw.android.security.MemShieldDb
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import com.termux.view.TerminalViewClient
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 class MainActivity : AppCompatActivity() {
     companion object {
@@ -83,6 +87,7 @@ class MainActivity : AppCompatActivity() {
         setupTerminalView()
         setupWebView()
         setupExtraKeys()
+        setupClearLogButton()
         sessionManager.onSessionsChanged = { updateSessionTabs() }
 
         // Start unified OpenClaw + PRISM foreground service
@@ -188,6 +193,19 @@ class MainActivity : AppCompatActivity() {
 
     fun reloadWebView() {
         binding.webView.reload()
+    }
+
+    // --- Clear log ---
+
+    private fun setupClearLogButton() {
+        binding.btnClearLog.setOnClickListener { btn ->
+            CoroutineScope(Dispatchers.IO).launch {
+                MemShieldDb.get(this@MainActivity).auditDao().deleteAll()
+            }
+            // Brief visual feedback — flash dim then restore
+            btn.alpha = 0.2f
+            btn.postDelayed({ btn.alpha = 1f }, 300)
+        }
     }
 
     // --- View switching ---
@@ -299,10 +317,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateModifierButton(button: Button, active: Boolean) {
-        val bgColor = if (active) R.color.extraKeyActive else R.color.extraKeyDefault
-        val txtColor = if (active) R.color.extraKeyActiveText else R.color.extraKeyText
-        button.backgroundTintList = ColorStateList.valueOf(ContextCompat.getColor(this, bgColor))
-        button.setTextColor(ContextCompat.getColor(this, txtColor))
+        // Modifier active = bright white text; inactive = dim gray. No background change.
+        button.setTextColor(if (active) Color.WHITE else Color.parseColor("#777777"))
     }
 
     // --- Session tab bar ---
@@ -329,30 +345,19 @@ class MainActivity : AppCompatActivity() {
         val active = info["active"] as Boolean
         val finished = info["finished"] as Boolean
 
+        // Tab = vertical LinearLayout: [content row] + [1dp bottom indicator]
         val tabWrapper = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.MATCH_PARENT,
             ).apply { marginEnd = (TAB_MARGIN_DP * density).toInt() }
-            val bgColor = if (active) R.color.tabActiveBackground else R.color.tabInactiveBackground
-            setBackgroundColor(ContextCompat.getColor(this@MainActivity, bgColor))
+            setBackgroundColor(Color.BLACK)
             isFocusable = false
             isFocusableInTouchMode = false
         }
 
-        val tabContent = createTabContent(name, active, finished, id, density)
-        val indicator = createTabIndicator(active, density)
-        tabWrapper.addView(tabContent)
-        tabWrapper.addView(indicator)
-        tabWrapper.setOnClickListener {
-            sessionManager.switchSession(id)
-            binding.terminalView.requestFocus()
-        }
-        return tabWrapper
-    }
-
-    private fun createTabContent(name: String, active: Boolean, finished: Boolean, id: String, density: Float): LinearLayout {
+        // Content row: name + \u00D7
         val tabContent = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -367,12 +372,11 @@ class MainActivity : AppCompatActivity() {
         val nameView = TextView(this).apply {
             text = name
             textSize = TAB_NAME_TEXT_SIZE
-            val textColor = when {
-                finished -> R.color.tabTextFinished
-                active -> R.color.tabTextPrimary
-                else -> R.color.tabTextSecondary
-            }
-            setTextColor(ContextCompat.getColor(this@MainActivity, textColor))
+            setTextColor(when {
+                finished -> Color.parseColor("#2a2a2a")
+                active   -> Color.WHITE
+                else     -> Color.parseColor("#555555")
+            })
             if (finished) setTypeface(typeface, Typeface.ITALIC)
             isSingleLine = true
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
@@ -381,7 +385,7 @@ class MainActivity : AppCompatActivity() {
         val closeView = TextView(this).apply {
             text = "\u00D7"
             textSize = TAB_CLOSE_TEXT_SIZE
-            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.tabTextSecondary))
+            setTextColor(Color.parseColor("#444444"))
             setPadding((TAB_CLOSE_PAD_DP * density).toInt(), 0, 0, 0)
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             isFocusable = false
@@ -391,21 +395,27 @@ class MainActivity : AppCompatActivity() {
 
         tabContent.addView(nameView)
         tabContent.addView(closeView)
-        return tabContent
-    }
 
-    private fun createTabIndicator(active: Boolean, density: Float): View =
-        View(this).apply {
+        // Bottom indicator \u2014 white 1dp for active, invisible for inactive
+        val indicator = View(this).apply {
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (INDICATOR_HEIGHT_DP * density).toInt())
-            val color = if (active) R.color.tabAccent else android.R.color.transparent
-            setBackgroundColor(ContextCompat.getColor(this@MainActivity, color))
+            setBackgroundColor(if (active) Color.WHITE else Color.TRANSPARENT)
         }
+
+        tabWrapper.addView(tabContent)
+        tabWrapper.addView(indicator)
+        tabWrapper.setOnClickListener {
+            sessionManager.switchSession(id)
+            binding.terminalView.requestFocus()
+        }
+        return tabWrapper
+    }
 
     private fun createAddButton(density: Float): TextView =
         TextView(this).apply {
             text = "+"
             textSize = TAB_ADD_TEXT_SIZE
-            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.tabTextSecondary))
+            setTextColor(Color.parseColor("#444444"))
             val pad = (TAB_ADD_PAD_DP * density).toInt()
             setPadding(pad, 0, pad, 0)
             gravity = Gravity.CENTER

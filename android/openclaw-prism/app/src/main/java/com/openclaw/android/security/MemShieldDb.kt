@@ -63,6 +63,9 @@ interface AuditDao {
 
     @Query("SELECT COUNT(*) FROM audit_log WHERE verdict = 'ALLOW'")
     suspend fun allowedCount(): Int
+
+    @Query("DELETE FROM audit_log")
+    suspend fun deleteAll()
 }
 
 // ── Database ──────────────────────────────────────────────────────────────────
