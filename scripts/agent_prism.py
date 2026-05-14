@@ -1226,13 +1226,11 @@ examples:
     # queue-run: pull next due task and run it in-process right now
     if a.queue_run:
         q = TaskQueue()
-        due = q.get_due_tasks()
-        if not due:
+        task_row = q.claim_next_due_task()   # atomic — safe alongside daemon
+        if task_row is None:
             print("No tasks due.")
             sys.exit(0)
-        task_row = due[0]
         print(f"Running task [{task_row['id'][:8]}]: {task_row['task_text']}")
-        q.mark_running(task_row["id"])
         ok = run(
             task_row["task_text"],
             a.serial,

@@ -96,6 +96,8 @@ def parse_schedule(schedule: str, from_ts: Optional[float] = None) -> float:
     m = _EVERY.match(schedule)
     if m:
         amount, unit = int(m.group(1)), m.group(2)
+        if amount == 0:
+            raise ValueError("every:0 is not allowed — interval must be > 0")
         seconds = amount * {"s": 1, "m": 60, "h": 3600}[unit]
         return now + seconds
 
@@ -208,6 +210,28 @@ class TaskQueue:
                 (now,),
             ).fetchall()
 
+    def claim_next_due_task(self) -> "sqlite3.Row | None":
+        """Atomically claim the next due pending task.
+
+        Single UPDATE … RETURNING statement — two concurrent callers (e.g. the
+        daemon and --queue-run) cannot both claim the same row because the outer
+        AND status='pending' guard makes the second UPDATE a no-op.
+        """
+        now = time.time()
+        with self._conn() as conn:
+            return conn.execute(
+                """UPDATE tasks
+                   SET status = 'running', started_at = ?
+                   WHERE id = (
+                       SELECT id FROM tasks
+                       WHERE status = 'pending' AND execute_after <= ?
+                       ORDER BY execute_after ASC
+                       LIMIT 1
+                   ) AND status = 'pending'
+                   RETURNING *""",
+                (now, now),
+            ).fetchone()
+
     def mark_running(self, task_id: str) -> None:
         with self._conn() as conn:
             conn.execute(
@@ -318,6 +342,57 @@ class TaskQueue:
                 (now, next_run, job_id),
             )
         return next_run
+
+    def fire_cron_job(self, job_id: str) -> "str | None":
+        """Atomically claim and fire a cron job.
+
+        Uses UPDATE … WHERE next_run_at <= now RETURNING * as the claim gate so
+        two concurrent daemon processes cannot both fire the same schedule slot:
+        only one UPDATE satisfies AND next_run_at <= now; the second finds
+        next_run_at already advanced past now and returns no rows.
+
+        Returns the new task id, or None if the job was not found, is disabled,
+        or was already claimed by another caller.
+        """
+        now = time.time()
+        with self._conn() as conn:
+            # Read schedule first — needed to compute next_run_at in Python.
+            # This SELECT does not claim anything; the UPDATE below is the gate.
+            sched_row = conn.execute(
+                "SELECT schedule FROM cron_jobs WHERE id=? AND enabled=1",
+                (job_id,),
+            ).fetchone()
+            if not sched_row:
+                return None
+            next_run = parse_schedule(sched_row["schedule"], from_ts=now)
+
+            # Atomic claim: advances next_run_at only if still due.
+            # A concurrent caller that lost the race finds next_run_at already
+            # in the future, matches no rows, and gets no RETURNING row.
+            job = conn.execute(
+                """UPDATE cron_jobs
+                   SET last_run_at = ?, next_run_at = ?
+                   WHERE id = ? AND enabled = 1 AND next_run_at <= ?
+                   RETURNING *""",
+                (now, next_run, job_id, now),
+            ).fetchone()
+            if not job:
+                return None  # lost the race — another process already claimed this slot
+
+            # Insert task in the same transaction.
+            tid = str(uuid.uuid4())
+            conn.execute(
+                """INSERT INTO tasks
+                   (id, task_text, llm, no_prism, learn, status, source,
+                    cron_job_id, created_at, execute_after)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    tid, job["task_text"], job["llm"],
+                    job["no_prism"], job["learn"],
+                    "pending", "cron", job_id, now, now,
+                ),
+            )
+        return tid
 
     def enable_cron_job(self, job_id: str, enabled: bool = True) -> None:
         with self._conn() as conn:

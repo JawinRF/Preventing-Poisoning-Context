@@ -40,10 +40,35 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 import json
+
+
+# ── Bounded dedup set ─────────────────────────────────────────────────────────
+
+class _BoundedSet:
+    """Fixed-capacity set that evicts the oldest entry on overflow.
+
+    Prevents the observer's seen-hash set from growing unbounded during a long
+    daemon run while still deduplicating repeated notifications within a session.
+    """
+
+    def __init__(self, maxsize: int = 500):
+        self._d: OrderedDict = OrderedDict()
+        self._max = maxsize
+
+    def __contains__(self, item: str) -> bool:
+        return item in self._d
+
+    def add(self, item: str) -> None:
+        if item in self._d:
+            return
+        if len(self._d) >= self._max:
+            self._d.popitem(last=False)   # evict oldest
+        self._d[item] = None
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -164,16 +189,14 @@ class QueueRunner(threading.Thread):
             self.stop_event.wait(_QUEUE_INTERVAL)
 
     def _tick(self) -> None:
-        due = self.q.get_due_tasks()
-        if not due:
+        task = self.q.claim_next_due_task()   # atomic: no concurrent double-claim
+        if task is None:
             return
 
-        task = due[0]  # one at a time
-        tid  = task["id"]
-        txt  = task["task_text"]
+        tid = task["id"]
+        txt = task["task_text"]
         log.info("Running task [%s]: %s", tid[:8], txt[:60])
 
-        self.q.mark_running(tid)
         ok, note = self._run_subprocess(task)
         self.q.mark_done(tid, ok=ok, note=note)
 
@@ -235,16 +258,13 @@ class CronScheduler(threading.Thread):
             name = job["name"] or job["task_text"][:40]
             log.info("Cron job [%s] due: %s", jid[:8], name)
 
-            tid = self.q.add_task(
-                job["task_text"],
-                llm=job["llm"],
-                no_prism=bool(job["no_prism"]),
-                learn=bool(job["learn"]),
-                source="cron",
-                cron_job_id=jid,
-            )
-            next_run = self.q.advance_cron_job(jid)
-            next_str = datetime.fromtimestamp(next_run).strftime("%Y-%m-%d %H:%M")
+            # fire_cron_job advances next_run_at and inserts the task atomically.
+            tid = self.q.fire_cron_job(jid)
+            if tid is None:
+                log.warning("Cron job [%s] disappeared or was disabled mid-tick", jid[:8])
+                continue
+            refreshed = self.q.get_cron_job(jid)
+            next_str  = datetime.fromtimestamp(refreshed["next_run_at"]).strftime("%Y-%m-%d %H:%M")
             log.info("  → queued task [%s]; next run: %s", tid[:8], next_str)
 
 
@@ -268,8 +288,8 @@ class DeviceObserver(threading.Thread):
         self.serial        = serial
         self.stop_event    = stop_event
         self.auto_queue    = auto_queue
-        self._seen_hashes: set[str] = set()   # dedup across ticks
-        self._warned_down  = False             # suppress repeated "sidecar down" logs
+        self._seen        = _BoundedSet(maxsize=500)   # dedup, evicts oldest after 500 entries
+        self._warned_down = False                       # suppress repeated "sidecar down" logs
 
     def run(self) -> None:
         log.info("DeviceObserver started (interval=%ds)", _OBS_INTERVAL)
@@ -321,9 +341,9 @@ class DeviceObserver(threading.Thread):
 
     def _handle_item(self, text: str, path: str, label: str) -> None:
         h = hashlib.sha256(text.encode()).hexdigest()
-        if h in self._seen_hashes:
+        if h in self._seen:
             return
-        self._seen_hashes.add(h)
+        self._seen.add(h)
 
         result = self._prism_inspect(text, path, label)
         if result is None:
