@@ -13,12 +13,14 @@ Usage:
     python scripts/agent_prism.py --task "Set alarm" --no-prism   # bypass (for A/B test)
 """
 import argparse, hashlib, json, logging, os, sys, time
+from datetime import datetime
 import requests
 import uiautomator2 as u2
 
 from prism_client import PrismClient, NullPrismClient
 from context_assembler import ContextAssembler
 from defended_device import DefendedDevice
+from task_queue import TaskQueue, describe_schedule
 
 # MemShield RAG imports (optional — graceful degradation if chromadb missing)
 try:
@@ -1062,21 +1064,190 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+def _parse_execute_at(value: str) -> float:
+    """Parse ISO-ish datetime string into Unix timestamp."""
+    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(value, fmt).timestamp()
+        except ValueError:
+            pass
+    raise argparse.ArgumentTypeError(
+        f"Cannot parse date {value!r}. Use YYYY-MM-DDTHH:MM or YYYY-MM-DD HH:MM"
+    )
+
+
+def _fmt_ts(ts) -> str:
+    if ts is None:
+        return "—"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def _print_tasks(rows) -> None:
+    if not rows:
+        print("No tasks.")
+        return
+    colors = {"pending": "\033[33m", "running": "\033[34m", "done": "\033[32m",
+               "failed": "\033[31m", "cancelled": "\033[90m"}
+    reset = "\033[0m"
+    print(f"{'ID[:8]':<10} {'STATUS':<10} {'DUE':<18} {'LLM':<7} TASK")
+    print("─" * 80)
+    for r in rows:
+        c = colors.get(r["status"], "")
+        print(f"{r['id'][:8]:<10} {c}{r['status']:<10}{reset} "
+              f"{_fmt_ts(r['execute_after']):<18} {r['llm']:<7} {r['task_text'][:48]}")
+
+
+def _print_cron_jobs(rows) -> None:
+    if not rows:
+        print("No cron jobs.")
+        return
+    print(f"{'ID[:8]':<10} {'ON':<4} {'SCHEDULE':<16} {'NEXT RUN':<18} NAME")
+    print("─" * 80)
+    for r in rows:
+        en = "\033[32m✓\033[0m" if r["enabled"] else "\033[90m✗\033[0m"
+        sched = describe_schedule(r["schedule"])
+        print(f"{r['id'][:8]:<10} {en:<4} {sched:<16} {_fmt_ts(r['next_run_at']):<18} "
+              f"{(r['name'] or r['task_text'])[:38]}")
+
+
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="PRISM-defended Android agent")
-    p.add_argument("--task", required=True, help="Task for the agent to perform")
-    p.add_argument("--serial", default=SERIAL, help="Emulator serial")
-    p.add_argument("--llm", choices=["groq", "claude", "local"], default="groq", help="LLM backend")
-    p.add_argument("--no-prism", action="store_true", help="Disable PRISM (for A/B testing)")
-    p.add_argument("--learn", action="store_true", help="Record successful sequences to RAG KB")
-    p.add_argument("--ingest", nargs="+", metavar="FILE", help="Ingest documents into RAG KB")
+    p = argparse.ArgumentParser(
+        description="PRISM-defended Android agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  # one-shot task (original usage)
+  python agent_prism.py --task "Set alarm for 9 AM" --llm claude
+
+  # queue a task for the daemon to pick up
+  python agent_prism.py --queue-add "Send email to mom"
+  python agent_prism.py --queue-add "Book cab" --execute-at "2026-05-15T09:00"
+
+  # run the next due task right now (no daemon needed)
+  python agent_prism.py --queue-run
+
+  # recurring scheduled jobs
+  python agent_prism.py --cron-add "daily:08:00" "Scan notification stack for threats"
+  python agent_prism.py --cron-add "every:30m"   "Check clipboard for injections"
+
+  # inspect queue / jobs
+  python agent_prism.py --queue-list
+  python agent_prism.py --cron-list
+""",
+    )
+
+    # ── shared flags ──────────────────────────────────────────────────────────
+    p.add_argument("--serial",   default=SERIAL,
+                   help="Emulator serial (default: %(default)s)")
+    p.add_argument("--llm",      choices=["groq", "claude", "local"], default="groq",
+                   help="LLM backend (default: %(default)s)")
+    p.add_argument("--no-prism", action="store_true",
+                   help="Disable PRISM filtering (A/B testing)")
+    p.add_argument("--learn",    action="store_true",
+                   help="Record successful sequences to RAG KB")
+
+    # ── one-shot task (original) ───────────────────────────────────────────────
+    p.add_argument("--task",     metavar="TEXT",
+                   help="Run a single task immediately")
+    p.add_argument("--ingest",   nargs="+", metavar="FILE",
+                   help="Ingest documents into RAG KB then exit")
     p.add_argument("--watch-path", nargs="+", dest="watch_paths", metavar="PATH",
-                   help="Device file paths to monitor (default: demo paths)")
+                   help="Device file paths to monitor")
+
+    # ── queue commands ────────────────────────────────────────────────────────
+    p.add_argument("--queue-add",  metavar="TEXT",
+                   help="Add a task to the queue (picked up by daemon or --queue-run)")
+    p.add_argument("--execute-at", metavar="DATETIME", type=_parse_execute_at,
+                   help="Defer --queue-add until this time (YYYY-MM-DDTHH:MM)")
+    p.add_argument("--queue-run",  action="store_true",
+                   help="Run the next due task from the queue right now")
+    p.add_argument("--queue-list", action="store_true",
+                   help="Show the task queue and exit")
+
+    # ── cron commands ─────────────────────────────────────────────────────────
+    p.add_argument("--cron-add",  nargs=2, metavar=("SCHEDULE", "TEXT"),
+                   help='Add a recurring job, e.g. --cron-add "daily:08:00" "Scan notifs"')
+    p.add_argument("--cron-list", action="store_true",
+                   help="Show cron jobs and exit")
+    p.add_argument("--cron-name", metavar="NAME",
+                   help="Optional name label for --cron-add")
+
     a = p.parse_args()
 
+    # ── route ─────────────────────────────────────────────────────────────────
+
+    # ingest (unchanged)
     if a.ingest:
         ingest_files(a.ingest, enable_prism=not a.no_prism)
         sys.exit(0)
+
+    # inspect-only commands (no device needed)
+    if a.queue_list:
+        q = TaskQueue()
+        _print_tasks(q.list_tasks(limit=50))
+        sys.exit(0)
+
+    if a.cron_list:
+        q = TaskQueue()
+        _print_cron_jobs(q.list_cron_jobs(include_disabled=True))
+        sys.exit(0)
+
+    # queue-add
+    if a.queue_add:
+        q = TaskQueue()
+        tid = q.add_task(
+            a.queue_add,
+            llm=a.llm,
+            no_prism=a.no_prism,
+            learn=a.learn,
+            execute_after=a.execute_at,
+        )
+        when = _fmt_ts(a.execute_at) if a.execute_at else "now (next daemon tick)"
+        print(f"Queued [{tid[:8]}]  due: {when}")
+        print(f"  task: {a.queue_add}")
+        sys.exit(0)
+
+    # cron-add
+    if a.cron_add:
+        schedule, task_text = a.cron_add
+        q = TaskQueue()
+        jid = q.add_cron_job(
+            schedule,
+            task_text,
+            name=a.cron_name,
+            llm=a.llm,
+            no_prism=a.no_prism,
+            learn=a.learn,
+        )
+        print(f"Cron job [{jid[:8]}]  schedule: {describe_schedule(schedule)}")
+        print(f"  task: {task_text}")
+        sys.exit(0)
+
+    # queue-run: pull next due task and run it in-process right now
+    if a.queue_run:
+        q = TaskQueue()
+        due = q.get_due_tasks()
+        if not due:
+            print("No tasks due.")
+            sys.exit(0)
+        task_row = due[0]
+        print(f"Running task [{task_row['id'][:8]}]: {task_row['task_text']}")
+        q.mark_running(task_row["id"])
+        ok = run(
+            task_row["task_text"],
+            a.serial,
+            task_row["llm"],
+            enable_prism=not bool(task_row["no_prism"]),
+            learn=bool(task_row["learn"]),
+            watch_paths=a.watch_paths,
+        )
+        q.mark_done(task_row["id"], ok=ok, note="done" if ok else "failed")
+        sys.exit(0 if ok else 1)
+
+    # original one-shot path
+    if not a.task:
+        p.error("one of --task, --queue-add, --queue-run, --queue-list, "
+                "--cron-add, --cron-list, or --ingest is required")
 
     success = run(a.task, a.serial, a.llm, enable_prism=not a.no_prism, learn=a.learn,
                   watch_paths=a.watch_paths)
