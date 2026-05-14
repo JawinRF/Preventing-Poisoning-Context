@@ -74,6 +74,9 @@ GROQ_MODEL = "llama-3.3-70b-versatile"
 
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 
+DEEPSEEK_API   = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+
 OLLAMA_URL  = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
 LOCAL_MODEL = os.getenv("LOCAL_MODEL", "qwen2.5:1.5b")
 
@@ -439,6 +442,63 @@ def ask_groq(prompt_dict: dict) -> dict:
             r.raise_for_status()
             raw = r.json()["choices"][0]["message"]["content"].strip()
             # Record assistant response so the model sees it next turn
+            _conversation.append({"role": "assistant", "content": raw})
+            return _parse_json(raw)
+        except requests.exceptions.Timeout:
+            if attempt < 3:
+                time.sleep(2 ** attempt)
+                continue
+            _conversation.pop()
+            return _fail("timeout")
+        except Exception as e:
+            _conversation.pop()
+            return _fail(str(e))
+
+    _conversation.pop()
+    return _fail("max retries")
+
+
+def ask_deepseek(prompt_dict: dict) -> dict:
+    """Call DeepSeek API (OpenAI-compatible) with multi-turn conversation history.
+
+    Text-only — DeepSeek-V3 does not support vision.
+    Set DEEPSEEK_MODEL=deepseek-reasoner to use R1 (slower, chain-of-thought).
+    """
+    global _last_request_time
+
+    now = time.time()
+    wait = _request_min_interval - (now - _last_request_time)
+    if wait > 0:
+        time.sleep(wait)
+
+    prompt_dict.pop("_screenshot_b64", None)
+
+    _conversation.append({"role": "user", "content": json.dumps(prompt_dict)})
+    _trim_conversation()
+
+    key = os.environ.get("DEEPSEEK_API_KEY", "")
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": list(_conversation),
+        "temperature": 0.1,
+        "max_tokens": 300,
+    }
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+
+    for attempt in range(4):
+        try:
+            r = requests.post(DEEPSEEK_API, json=payload, headers=headers, timeout=30)
+            _last_request_time = time.time()
+
+            if r.status_code in (429, 500, 502, 503, 504):
+                if attempt < 3:
+                    time.sleep(2 ** attempt)
+                    continue
+                _conversation.pop()
+                return _fail("api error")
+
+            r.raise_for_status()
+            raw = r.json()["choices"][0]["message"]["content"].strip()
             _conversation.append({"role": "assistant", "content": raw})
             return _parse_json(raw)
         except requests.exceptions.Timeout:
@@ -925,7 +985,8 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
         ],
     )
 
-    ask = {"groq": ask_groq, "claude": ask_claude, "local": ask_local}[llm]
+    ask = {"groq": ask_groq, "claude": ask_claude, "local": ask_local,
+           "deepseek": ask_deepseek}[llm]
     action_history = ActionHistory()
     progress = ProgressTracker()
     last_sig = None
@@ -1139,7 +1200,7 @@ examples:
     # ── shared flags ──────────────────────────────────────────────────────────
     p.add_argument("--serial",   default=SERIAL,
                    help="Emulator serial (default: %(default)s)")
-    p.add_argument("--llm",      choices=["groq", "claude", "local"], default="groq",
+    p.add_argument("--llm",      choices=["groq", "claude", "local", "deepseek"], default="groq",
                    help="LLM backend (default: %(default)s)")
     p.add_argument("--no-prism", action="store_true",
                    help="Disable PRISM filtering (A/B testing)")
