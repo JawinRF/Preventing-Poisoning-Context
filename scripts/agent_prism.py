@@ -213,6 +213,7 @@ Rules:
 - If open_app fails or nothing changes, try: press home, swipe up to open app drawer, then tap the app
 - For forms: tap input field first, then type, then tap save/confirm button
 - Only say done when task is visibly complete on screen
+- screen_matches is a hint: elements whose text/desc appears related to your task. Use it as a reference when deciding what to tap — but use your own judgement, it may include false positives or miss elements.
 - Return ONE JSON object, nothing else"""
 
 # Naive prompt for undefended mode — no mention of PRISM or security filtering.
@@ -253,6 +254,7 @@ Rules:
 - If open_app fails or nothing changes, try: press home, swipe up to open app drawer, then tap the app
 - For forms: tap input field first, then type, then tap save/confirm button
 - Only say done when task is visibly complete on screen
+- screen_matches is a hint: elements whose text/desc appears related to your task. Use it as a reference when deciding what to tap — but use your own judgement, it may include false positives or miss elements.
 - Return ONE JSON object, nothing else"""
 
 # Active system prompt — set by run() based on enable_prism flag
@@ -1379,8 +1381,9 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
             print(f"  {RED}PRISM blocked {total_blocked} item(s): {ctx.blocked_counts}{RESET}")
         if ctx.notifications:
             print(f"  Notifications: {len(ctx.notifications)} safe")
-        if ctx.degraded_paths:
-            print(f"  {YELLOW}DEGRADED: {', '.join(ctx.degraded_paths)} unavailable{RESET}")
+        if ctx.degraded_paths and step == 1:
+            # Only print DEGRADED on step 1 — sidecar status won't change mid-run.
+            print(f"  {YELLOW}DEGRADED: {', '.join(ctx.degraded_paths)} unavailable (sidecar :8766 down){RESET}")
 
         # ── Track screen state for progress detection ─────────────────────
         progress.record_screen(ctx.ui_elements, ctx.screen_changed)

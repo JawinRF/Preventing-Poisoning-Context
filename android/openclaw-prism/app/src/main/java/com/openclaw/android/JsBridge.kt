@@ -476,6 +476,11 @@ class JsBridge(
     }
 
     @JavascriptInterface
+    fun clearAuditFeed(): Unit = runBlocking {
+        MemShieldDb.get(activity).auditDao().deleteAll()
+    }
+
+    @JavascriptInterface
     fun getSidecarHealth(): String {
         val pythonStatus = try {
             val url = java.net.URL("http://127.0.0.1:8765/health")

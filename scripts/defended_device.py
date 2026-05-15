@@ -397,10 +397,10 @@ class DefendedDevice:
                 if DANGEROUS_TYPE_PATTERNS.search(text_data):
                     logger.warning(f"BLOCKED typed text (dangerous pattern): {text_data[:60]}")
                     return "blocked_by_prism"
-                r = self._prism.inspect(text_data, "agent_output", "text_input")
-                result = self._resolve_verdict(r)
-                if result:
-                    return result
+                # ML injection scan intentionally skipped for agent-typed text.
+                # DANGEROUS_TYPE_PATTERNS above covers genuine threats (shell cmds,
+                # URLs). The ML model was trained on incoming untrusted text and
+                # false-positives on normal search queries (e.g. "openai").
 
         elif action == "open_app":
             pkg = params.get("package", "")

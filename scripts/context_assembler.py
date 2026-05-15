@@ -17,7 +17,7 @@ Architecture:
     execution).
 """
 from __future__ import annotations
-import json, logging, subprocess
+import json, logging, re, subprocess
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from urllib.error import URLError
@@ -132,6 +132,29 @@ class AssembledContext:
         # ── SCREEN (device UI — needed for navigation) ──────────────────
         d["screen"] = self.ui_elements
 
+        # ── SCREEN MATCHES — elements relevant to the task ───────────────
+        # Extract meaningful keywords from the task (skip short stop-words).
+        _STOP = frozenset({
+            "a","an","the","in","on","at","to","for","of","and","or","is",
+            "it","me","my","its","go","do","i","get","use","open","find","search",
+        })
+        task_kws = frozenset(
+            w for w in re.findall(r"[a-z]{3,}", self.task.lower())
+            if w not in _STOP
+        )
+        if task_kws:
+            matches = []
+            for e in self.ui_elements:
+                haystack = " ".join(filter(None, [
+                    str(e.get("text", "")),
+                    str(e.get("desc", "")),
+                    str(e.get("rid", "")),
+                ])).lower()
+                if any(kw in haystack for kw in task_kws):
+                    matches.append(e)
+            if matches:
+                d["screen_matches"] = matches  # subset already visible that fits the task
+
         # ── INSTALLED APPS (trusted — from device package manager) ──────
         if self.installed_apps:
             d["installed_apps"] = self.installed_apps
@@ -236,6 +259,10 @@ class ContextAssembler:
         self.serial = serial
         self.memshield = memshield
         self.watched_paths = watched_paths or []
+        # Sidecar reachability cache — avoids 5s timeout on every step when down.
+        # _sidecar_retry_at: monotonic time after which we try again.
+        self._sidecar_retry_at: float = 0.0
+        self._sidecar_warned: bool = False
         self._ensure_sidecar_forward()
 
     def _ensure_sidecar_forward(self) -> None:
@@ -321,16 +348,44 @@ class ContextAssembler:
     def _fetch_device_context(self) -> dict | None:
         """Fetch all device context from the Android sidecar in one call.
 
-        Returns the parsed JSON dict, or None if the sidecar is unreachable.
-        Contains: notifications, clipboard, sms, contacts, calendar.
+        Caches reachability: on failure, skips retrying for 30s to avoid
+        burning 5s of timeout on every agent step when the sidecar is down.
+        On first failure, attempts to wake the OpenClaw service via ADB.
         """
+        import time as _time
+        now = _time.monotonic()
+        if now < self._sidecar_retry_at:
+            return None  # known-down, skip without timeout cost
+
         try:
             req = Request(f"{_ANDROID_SIDECAR_URL}/v1/context", method="GET")
             with urlopen(req, timeout=_SIDECAR_TIMEOUT_S) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                data = json.loads(resp.read().decode("utf-8"))
+            # Successful — reset state
+            if self._sidecar_warned:
+                logger.info("Android sidecar :8766 reachable again")
+                self._sidecar_warned = False
+            return data
         except (URLError, OSError, json.JSONDecodeError) as e:
-            logger.warning(f"Android sidecar :8766 unreachable: {e}")
+            if not self._sidecar_warned:
+                logger.warning(f"Android sidecar :8766 unreachable: {e}")
+                self._sidecar_warned = True
+                self._try_wake_sidecar()
+            # Back off 30s before next real attempt
+            self._sidecar_retry_at = _time.monotonic() + 30.0
             return None
+
+    def _try_wake_sidecar(self) -> None:
+        """Try to bring the OpenClaw Android service to the foreground."""
+        try:
+            subprocess.run(
+                ["adb", "-s", self.serial, "shell", "am", "start",
+                 "-n", "com.openclaw.android.debug/com.openclaw.android.MainActivity"],
+                capture_output=True, timeout=5,
+            )
+            logger.info("Attempted to wake OpenClaw service via ADB")
+        except Exception:
+            pass
 
     # ── Filter functions (consume from _fetch_device_context result) ──────────
 

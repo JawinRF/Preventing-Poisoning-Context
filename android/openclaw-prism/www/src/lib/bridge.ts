@@ -42,6 +42,7 @@ interface OpenClawBridge {
   // PRISM Security
   getSecurityStatus(): string
   getAuditFeed(): string
+  clearAuditFeed(): void
   getSidecarHealth(): string
   getPermissionStatus(): string
 }

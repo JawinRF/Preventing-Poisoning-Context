@@ -51,7 +51,17 @@ export function SecurityDashboard() {
 
       <div className="feed-header">
         <div className="section-title">{t('sec_live_feed')}</div>
-        <div className="feed-count">{feed.length} events</div>
+        <div className="feed-header-right">
+          <div className="feed-count">{feed.length} events</div>
+          {feed.length > 0 && (
+            <button
+              className="clear-feed-btn"
+              onClick={() => { bridge.call('clearAuditFeed'); setFeed([]) }}
+            >
+              Clear
+            </button>
+          )}
+        </div>
       </div>
 
       {feed.length === 0 ? (

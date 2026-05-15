@@ -59,6 +59,16 @@ class PrismAccessibilityService : AccessibilityService() {
             try {
                 // captureScreenContext() acquires its own window root internally.
                 val screenCtx = bridge.captureScreenContext() ?: return@launch
+
+                // Skip our own UI — no point scanning OpenClaw's dashboard.
+                val foregroundPkg = screenCtx.optString("foreground_package", "")
+                if (foregroundPkg == packageName) return@launch
+
+                // Skip captures with no visible text nodes — the ONNX model
+                // scores empty JSON near 1.0 (out-of-distribution input).
+                val visibleNodes = screenCtx.optJSONArray("visible_nodes")
+                if (visibleNodes == null || visibleNodes.length() == 0) return@launch
+
                 val payload = bridge.buildInspectPayload(screenCtx)
                 val rawText = payload.optString("text", "")
                 if (rawText.isBlank()) return@launch

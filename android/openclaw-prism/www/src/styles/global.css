@@ -556,9 +556,27 @@ body {
   justify-content: space-between;
 }
 
+.feed-header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .feed-count {
   color: var(--text-secondary);
   font-size: 11px;
+}
+
+.clear-feed-btn {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--error);
+  background: none;
+  border: 1px solid var(--error);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+  letter-spacing: 0.03em;
 }
 
 /* Feed */
