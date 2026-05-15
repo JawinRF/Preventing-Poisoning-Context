@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 _ANDROID_SIDECAR_URL = "http://127.0.0.1:8766"
 _CDP_PORT = 9222
 _CDP_MAX_CHARS = 2000  # keep web content concise for prompt
-_SIDECAR_TIMEOUT_S = 5
+_SIDECAR_TIMEOUT_S = 2
 
 
 def _annotate_marks(pil_img, elements: list[dict]):
@@ -99,6 +99,8 @@ class AssembledContext:
     intent_data: list[dict] = field(default_factory=list)
     storage_data: list[dict] = field(default_factory=list)
     rag_context: list[str] = field(default_factory=list)
+    memory_context: list[str] = field(default_factory=list)
+    skill_procedures: list[str] = field(default_factory=list)
     blocked_counts: dict[str, int] = field(default_factory=dict)
     warned_counts: dict[str, int] = field(default_factory=dict)
     degraded_paths: list[str] = field(default_factory=list)
@@ -123,6 +125,12 @@ class AssembledContext:
           DEVICE DATA  — notifications, clipboard, SMS, etc. (untrusted, spotlighted)
         """
         d: dict = {}
+
+        # ── SKILL PROCEDURE (highest priority — defines completion criteria) ─
+        # Injected BEFORE task so the agent reads the procedure first.
+        # The system prompt rules require completing all steps before done.
+        if self.skill_procedures:
+            d["task_procedure"] = self.skill_procedures[0]
 
         # ── TASK (trusted) ──────────────────────────────────────────────
         d["task"] = self.task
@@ -158,6 +166,17 @@ class AssembledContext:
         # ── INSTALLED APPS (trusted — from device package manager) ──────
         if self.installed_apps:
             d["installed_apps"] = self.installed_apps
+
+        # ── SKILLS & KB (T2 — MemShield-vetted at ingest, trusted instructions) ──
+        # These are outside the untrusted data boundary so the agent treats them
+        # as actionable guidance, not inert facts. Skills ingested via /skill add
+        # pass through PRISM's L1/L2 scan; only clean content reaches here.
+        if self.rag_context:
+            d["skills_and_kb"] = [f"[T2 src=rag] {item}" for item in self.rag_context]
+
+        # ── AGENT MEMORY (T1 — produced by agent itself, authority=0.9) ─────
+        if self.memory_context:
+            d["agent_memory"] = [f"[MEMORY src=agent] {item}" for item in self.memory_context]
 
         # ── DEVICE DATA (untrusted — spotlighted with per-item source tags) ──
         #
@@ -195,15 +214,6 @@ class AssembledContext:
             ]
         if self.clipboard:
             device_data["clipboard"] = f"[T3 src=clipboard] {self.clipboard}"
-        if self.rag_context:
-            # RAG items come from MemShield which has provenance metadata;
-            # plain strings here are the result of MemShield's filter pipeline,
-            # which should already have rejected obvious poison. Mark as T2
-            # (seen-before, MemShield-vetted) to distinguish from raw T3.
-            device_data["context"] = [
-                f"[T2 src=rag] {item}" for item in self.rag_context
-            ]
-
         if device_data:
             d["device_data_boundary"] = self._DEVICE_DATA_START
             d["device_data"] = device_data
@@ -259,11 +269,32 @@ class ContextAssembler:
         self.serial = serial
         self.memshield = memshield
         self.watched_paths = watched_paths or []
-        # Sidecar reachability cache — avoids 5s timeout on every step when down.
-        # _sidecar_retry_at: monotonic time after which we try again.
-        self._sidecar_retry_at: float = 0.0
-        self._sidecar_warned: bool = False
+        # Sidecar reachability cache — persisted to /tmp so the 30s backoff
+        # survives across ContextAssembler instances (one per agent run).
+        self._sidecar_state_file = "/tmp/prism_sidecar_retry_at"
+        self._sidecar_retry_at: float = self._load_sidecar_state()
+        self._sidecar_warned: bool = self._sidecar_retry_at > 0
         self._ensure_sidecar_forward()
+
+    def _load_sidecar_state(self) -> float:
+        import time as _t
+        try:
+            val = float(open(self._sidecar_state_file).read().strip())
+            # Convert wall-clock timestamp back to monotonic offset
+            wall_now = _t.time()
+            mono_now = _t.monotonic()
+            remaining = val - wall_now
+            return mono_now + remaining if remaining > 0 else 0.0
+        except Exception:
+            return 0.0
+
+    def _save_sidecar_state(self, mono_retry_at: float) -> None:
+        import time as _t
+        wall_retry_at = _t.time() + (mono_retry_at - _t.monotonic())
+        try:
+            open(self._sidecar_state_file, "w").write(str(wall_retry_at))
+        except Exception:
+            pass
 
     def _ensure_sidecar_forward(self) -> None:
         """Set up ADB port forward so host can reach :8766 on the emulator."""
@@ -337,9 +368,11 @@ class ContextAssembler:
         ctx.storage_data, stor_blocked = self._gather_storage()
         ctx.blocked_counts["shared_storage"] = stor_blocked
 
-        # 4. RAG Store
+        # 4. RAG Store (skills + KB) and agent memories (separate queries)
         ctx.rag_context, rag_blocked = self._gather_rag(rag_query or task, recent_actions)
         ctx.blocked_counts["rag_store"] = rag_blocked
+        ctx.memory_context = self._gather_memories(rag_query or task)
+        ctx.skill_procedures = self._gather_skill_procedures(rag_query or task)
 
         return ctx
 
@@ -370,22 +403,9 @@ class ContextAssembler:
             if not self._sidecar_warned:
                 logger.warning(f"Android sidecar :8766 unreachable: {e}")
                 self._sidecar_warned = True
-                self._try_wake_sidecar()
-            # Back off 30s before next real attempt
             self._sidecar_retry_at = _time.monotonic() + 30.0
+            self._save_sidecar_state(self._sidecar_retry_at)
             return None
-
-    def _try_wake_sidecar(self) -> None:
-        """Try to bring the OpenClaw Android service to the foreground."""
-        try:
-            subprocess.run(
-                ["adb", "-s", self.serial, "shell", "am", "start",
-                 "-n", "com.openclaw.android.debug/com.openclaw.android.MainActivity"],
-                capture_output=True, timeout=5,
-            )
-            logger.info("Attempted to wake OpenClaw service via ADB")
-        except Exception:
-            pass
 
     # ── Filter functions (consume from _fetch_device_context result) ──────────
 
@@ -793,12 +813,89 @@ class ContextAssembler:
                 query_texts=[enriched],
                 n_results=5,
                 session_id=self.prism.session_id,
+                where={"source": {"$ne": "memory"}},
             )
             docs = results.get("documents", [[]])[0]
             return docs, 0
         except Exception as e:
             logger.warning(f"RAG query failed: {e}")
             return [], 0
+
+    def _gather_memories(self, query: str) -> list[str]:
+        """Query memories through MemShield so retrieval-time defenses apply.
+
+        Using memshield.query() (not collection.query()) ensures that any
+        retrieval-defense pipeline (provenance verification, L1/L2 scan,
+        influence scoring) runs on memory docs before they reach the agent.
+        Docs injected directly into ChromaDB without a valid HMAC seal are
+        flagged or dropped here — even if they bypassed ingest-time checks.
+        """
+        if self.memshield is None:
+            return []
+        try:
+            raw = self.memshield.collection.query(
+                query_texts=[query], n_results=3,
+                where={"source": "memory"},
+                include=["documents", "metadatas"],
+            )
+            raw_docs  = raw.get("documents", [[]])[0]
+            raw_metas = raw.get("metadatas",  [[]])[0]
+            raw_ids   = raw.get("ids",        [[]])[0]
+
+            # ── Layer 1: provenance seal check (fast, deterministic) ─────────
+            # Docs without content_hash+provenance_ts were injected directly
+            # into ChromaDB, bypassing MemShield ingest. Purge immediately.
+            sealed_docs, sealed_metas, sealed_ids = [], [], []
+            for doc_id, doc, meta in zip(raw_ids, raw_docs, raw_metas or []):
+                if meta and meta.get("content_hash") and meta.get("provenance_ts"):
+                    sealed_docs.append(doc)
+                    sealed_metas.append(meta)
+                    sealed_ids.append(doc_id)
+                else:
+                    logger.warning(
+                        f"[PRISM] Layer-1 PURGE — no provenance seal "
+                        f"(direct DB injection): {doc[:80]}"
+                    )
+                    self.memshield.collection.delete(ids=[doc_id])
+
+            if not sealed_docs:
+                return []
+
+            # ── Layer 2: MemShield retrieval defense (influence + ragmask + authority + scorer)
+            # Routes sealed docs through the full cross-doc scoring pipeline.
+            # MemShield logs BLOCKED/QUARANTINED chunks with poison scores.
+            defended = self.memshield.query(
+                query_texts=[query],
+                n_results=len(sealed_docs),
+                session_id=self.prism.session_id,
+                where={"source": "memory"},
+            )
+            return defended.get("documents", [[]])[0]
+        except Exception:
+            return sealed_docs if 'sealed_docs' in dir() else []
+
+    def _gather_skill_procedures(self, query: str) -> list[str]:
+        """Query skills by trigger description, return procedure bodies."""
+        if self.memshield is None:
+            return []
+        try:
+            results = self.memshield.collection.query(
+                query_texts=[query],
+                n_results=3,
+                where={"source": "skill"},
+                include=["documents", "metadatas"],
+            )
+            procedures = []
+            docs  = results.get("documents", [[]])[0]
+            metas = results.get("metadatas", [[]])[0]
+            for doc, meta in zip(docs, metas or []):
+                # New format: description is the doc, procedure is in metadata body
+                # Old format: full text stored as doc, no separate body
+                body = meta.get("body") if meta else None
+                procedures.append(body if body else doc)
+            return procedures
+        except Exception:
+            return []
 
     # ── Utilities ────────────────────────────────────────────────────────────
 
