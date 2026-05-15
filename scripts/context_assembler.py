@@ -19,11 +19,18 @@ Architecture:
 from __future__ import annotations
 import json, logging, re, subprocess
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from prism_client import PrismClient
+from prism_client import InspectResult, PrismClient
+
+# Sentinel reused for notifications with empty text — avoids constructing a
+# new object on every step for every blank notification.
+_NOTIF_ALLOW_EMPTY = InspectResult(
+    verdict="ALLOW", confidence=1.0, reason="empty_text", layer="skip"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +276,12 @@ class ContextAssembler:
         self.serial = serial
         self.memshield = memshield
         self.watched_paths = watched_paths or []
+        # Per-run notification seen-set.
+        # Key: int fingerprint of (package, title, text) — Python hash(), valid
+        # within this process only.  Value: cached InspectResult.
+        # Only truly new or changed notifications reach the sidecar each step;
+        # previously seen notifications are served from this dict in O(1).
+        self._notif_seen: dict[int, InspectResult] = {}
         # Sidecar reachability cache — persisted to /tmp so the 30s backoff
         # survives across ContextAssembler instances (one per agent run).
         self._sidecar_state_file = "/tmp/prism_sidecar_retry_at"
@@ -338,24 +351,37 @@ class ContextAssembler:
         device_ctx = self._fetch_device_context()
 
         if device_ctx is not None:
-            # Each filter checks its *_error field and marks degraded if present
-            # Calendar excluded from default polling — the agent doesn't use
-            # it for decisions and pulling it in just adds attack surface.
-            # Calendar scanning is still available via _filter_calendar() for
-            # tasks that explicitly need it.
-            for name, attr, filter_fn in [
-                ("notifications", "notifications",   self._filter_notifications),
-                ("clipboard",     "clipboard",       self._filter_clipboard),
-                ("sms",           "sms_messages",    self._filter_sms),
-                ("contacts",      "contacts",        self._filter_contacts),
-            ]:
-                error_key = f"{name}_error"
-                if error_key in device_ctx:
-                    logger.warning(f"{name} unavailable on device: {device_ctx[error_key]}")
+            # Separate errored sources (no data available) from healthy ones.
+            # Calendar excluded from default polling — attack surface vs value.
+            _FILTERS = [
+                ("notifications", "notifications", self._filter_notifications),
+                ("clipboard",     "clipboard",     self._filter_clipboard),
+                ("sms",           "sms_messages",  self._filter_sms),
+                ("contacts",      "contacts",      self._filter_contacts),
+            ]
+            healthy = []
+            for name, attr, filter_fn in _FILTERS:
+                if f"{name}_error" in device_ctx:
+                    logger.warning(
+                        f"{name} unavailable on device: {device_ctx[f'{name}_error']}"
+                    )
                     ctx.blocked_counts[name] = 0
                     ctx.degraded_paths.append(name)
                 else:
-                    data, blocked = filter_fn(device_ctx)
+                    healthy.append((name, attr, filter_fn))
+
+            # Run all healthy filters concurrently — they are independent and
+            # each may block on the PRISM sidecar.  inspect_batch inside each
+            # filter uses the thread-safe PrismClient._cache_lock, so concurrent
+            # access to the shared LRU is safe.
+            if healthy:
+                with ThreadPoolExecutor(max_workers=len(healthy)) as _pool:
+                    futs = {
+                        name: (attr, _pool.submit(fn, device_ctx))
+                        for name, attr, fn in healthy
+                    }
+                for name, (attr, fut) in futs.items():
+                    data, blocked = fut.result()
                     setattr(ctx, attr, data)
                     ctx.blocked_counts[name] = blocked
         else:
@@ -409,38 +435,85 @@ class ContextAssembler:
 
     # ── Filter functions (consume from _fetch_device_context result) ──────────
 
+    @staticmethod
+    def _notif_fp(notif: dict) -> int:
+        """Fast fingerprint for a notification.
+
+        Stable within a process run — used to skip rescanning notifications
+        whose content hasn't changed since the last agent step.
+        Not cryptographic; collision probability is negligible at ≤1000 notifs.
+        """
+        return hash(
+            f"{notif.get('package', '')}\x00"
+            f"{notif.get('title',   '')}\x00"
+            f"{notif.get('text',    '')}"
+        )
+
     def _filter_notifications(self, device_ctx: dict) -> tuple[list[dict], int]:
-        """Filter notifications from device context through PRISM."""
+        """Filter notifications through PRISM with per-run deduplication.
+
+        Complexity per step:
+          O(N)  fingerprint + seen-set lookup        (always)
+          O(M)  sidecar calls, M = new/changed notifs (amortised → 0)
+          1     HTTP round-trip via inspect_batch     (when M > 0)
+
+        Previously seen, unchanged notifications are served from self._notif_seen
+        in O(1) without any network call.
+        """
         raw = device_ctx.get("notifications", [])
         if not raw:
             return [], 0
 
-        allowed = []
-        blocked = 0
+        # Step 1 — fingerprint all notifications; partition seen vs unseen  O(N)
+        fps       = [self._notif_fp(n) for n in raw]
+        unseen_idx = [i for i, fp in enumerate(fps) if fp not in self._notif_seen]
 
-        for notif in raw:
-            text = f"{notif.get('title', '')} {notif.get('text', '')}".strip()
-            if not text:
-                continue
+        # Step 2 — scan only unseen notifications, in a single batch call
+        if unseen_idx:
+            scan_idx:   list[int] = []
+            scan_texts: list[str] = []
+            for i in unseen_idx:
+                n    = raw[i]
+                text = f"{n.get('title', '')} {n.get('text', '')}".strip()
+                if text:
+                    scan_idx.append(i)
+                    scan_texts.append(text)
+                else:
+                    # Empty text — auto-allow, no sidecar call needed
+                    self._notif_seen[fps[i]] = _NOTIF_ALLOW_EMPTY
 
-            r = self.prism.inspect(
-                text=text,
-                ingestion_path="notifications",
-                source_type="notification",
-                source_name=notif.get("package", "unknown"),
-            )
+            if scan_texts:
+                # Single HTTP call for all unique unseen texts.
+                # inspect_batch deduplicates identical texts internally,
+                # so N unseen with K unique strings → K sidecar evaluations.
+                batch = self.prism.inspect_batch(
+                    scan_texts,
+                    ingestion_path="notifications",
+                    source_type="notification",
+                    source_name="android_notification",
+                )
+                for i, result in zip(scan_idx, batch):
+                    self._notif_seen[fps[i]] = result
+                    if not result.allowed:
+                        n    = raw[i]
+                        text = f"{n.get('title', '')} {n.get('text', '')}".strip()
+                        logger.warning(
+                            f"Notification BLOCKED: [{n.get('package')}] '{text[:60]}'"
+                        )
 
-            if r.allowed:
+        # Step 3 — build output entirely from seen cache  O(N), zero network
+        allowed: list[dict] = []
+        blocked: int = 0
+        for n, fp in zip(raw, fps):
+            result = self._notif_seen[fp]
+            if result.allowed:
                 allowed.append({
-                    "package": notif.get("package", "unknown"),
-                    "title": notif.get("title", ""),
-                    "text": notif.get("text", ""),
+                    "package": n.get("package", "unknown"),
+                    "title":   n.get("title",   ""),
+                    "text":    n.get("text",    ""),
                 })
             else:
                 blocked += 1
-                logger.warning(
-                    f"Notification BLOCKED: [{notif.get('package')}] '{text[:60]}'"
-                )
 
         return allowed, blocked
 
@@ -842,21 +915,26 @@ class ContextAssembler:
             raw_metas = raw.get("metadatas",  [[]])[0]
             raw_ids   = raw.get("ids",        [[]])[0]
 
+            logger.info(f"[Memory] Retrieved {len(raw_docs)} candidate(s) for query: {query[:60]}")
+
             # ── Layer 1: provenance seal check (fast, deterministic) ─────────
             # Docs without content_hash+provenance_ts were injected directly
             # into ChromaDB, bypassing MemShield ingest. Purge immediately.
             sealed_docs, sealed_metas, sealed_ids = [], [], []
             for doc_id, doc, meta in zip(raw_ids, raw_docs, raw_metas or []):
                 if meta and meta.get("content_hash") and meta.get("provenance_ts"):
+                    logger.info(f"[Memory] L1 PASS (sealed): {doc[:80]}")
                     sealed_docs.append(doc)
                     sealed_metas.append(meta)
                     sealed_ids.append(doc_id)
                 else:
                     logger.warning(
-                        f"[PRISM] Layer-1 PURGE — no provenance seal "
+                        f"[Memory] L1 PURGE — no provenance seal "
                         f"(direct DB injection): {doc[:80]}"
                     )
                     self.memshield.collection.delete(ids=[doc_id])
+
+            logger.info(f"[Memory] L1 result: {len(sealed_docs)}/{len(raw_docs)} sealed")
 
             if not sealed_docs:
                 return []
@@ -864,13 +942,16 @@ class ContextAssembler:
             # ── Layer 2: MemShield retrieval defense (influence + ragmask + authority + scorer)
             # Routes sealed docs through the full cross-doc scoring pipeline.
             # MemShield logs BLOCKED/QUARANTINED chunks with poison scores.
+            logger.info(f"[Memory] L2 MemShield running on {len(sealed_docs)} sealed doc(s)…")
             defended = self.memshield.query(
                 query_texts=[query],
                 n_results=len(sealed_docs),
                 session_id=self.prism.session_id,
                 where={"source": "memory"},
             )
-            return defended.get("documents", [[]])[0]
+            defended_docs = defended.get("documents", [[]])[0]
+            logger.info(f"[Memory] L2 result: {len(defended_docs)}/{len(sealed_docs)} passed MemShield")
+            return defended_docs
         except Exception:
             return sealed_docs if 'sealed_docs' in dir() else []
 

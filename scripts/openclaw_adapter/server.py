@@ -261,24 +261,38 @@ def handle_inspect(request: InspectRequest) -> InspectResponse:
 
 
 def handle_inspect_batch(items: list[dict]) -> list[dict]:
-    """Process multiple inspect requests sequentially.
+    """Process batch inspect requests with maximum parallelism.
 
-    NOTE: handle_inspect already submits work to _EXECUTOR internally,
-    so we must NOT submit handle_inspect itself to _EXECUTOR — that would
-    cause nested executor submissions and deadlock under load.
+    Each item is submitted to a dedicated thread that calls handle_inspect.
+    handle_inspect internally dispatches pipeline.evaluate_sync to _EXECUTOR
+    (max_workers=8), so up to 8 items run ONNX inference simultaneously.
+
+    We must NOT submit handle_inspect to _EXECUTOR itself (nested submission →
+    deadlock).  We use a separate short-lived pool here; its threads call
+    handle_inspect which then freely submits to _EXECUTOR.
+
+    Ordering is preserved: result[i] corresponds to items[i].
     """
-    results = []
-    for item in items:
+    if not items:
+        return []
+
+    _BATCH_ERROR = {
+        "verdict": "BLOCK", "confidence": 1.0,
+        "reason": "batch_item_error", "layer_triggered": "error",
+    }
+
+    def _run_one(item: dict) -> dict:
         try:
-            req = _validate_model(InspectRequest, item)
+            req  = _validate_model(InspectRequest, item)
             resp = handle_inspect(req)
-            results.append(_model_dump(resp))
+            return _model_dump(resp)
         except Exception:
-            results.append({
-                "verdict": "BLOCK", "confidence": 1.0,
-                "reason": "batch_item_error", "layer_triggered": "error",
-            })
-    return results
+            return _BATCH_ERROR
+
+    # Submit all items simultaneously; collect in original order.
+    with ThreadPoolExecutor(max_workers=min(len(items), 8)) as pool:
+        futures = [pool.submit(_run_one, item) for item in items]
+        return [f.result() for f in futures]
 
 
 def health() -> dict[str, str]:

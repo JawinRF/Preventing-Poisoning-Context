@@ -368,11 +368,17 @@ def _memory(args: list[str]) -> None:
         # and will be flagged by the retrieval-time defense.
         shield = _rag_shield(col)
         if shield:
-            shield.ingest_with_scan(
+            stats = shield.ingest_with_scan(
                 documents=[doc], ids=[doc_id],
                 metadatas=[{"source": "memory", "name": doc_id, "ts": ts}],
-                source="memory", authority=0.9,
+                source="memory", authority=0.5,
             )
+            if stats["blocked"]:
+                print(f"{RED}  PRISM blocked memory — content flagged as malicious{R}")
+                return
+            if stats["quarantined"]:
+                print(f"{YLW}  PRISM quarantined memory — content suspicious, not stored{R}")
+                return
         else:
             col.upsert(documents=[doc], ids=[doc_id],
                        metadatas=[{"source": "memory", "name": doc_id, "ts": ts}])
