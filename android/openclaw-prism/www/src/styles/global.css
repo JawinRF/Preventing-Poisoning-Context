@@ -93,6 +93,8 @@ body {
 .page {
   padding: 76px 14px 24px;
   min-height: 100vh;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
 }
 
 .page-header {
@@ -195,7 +197,7 @@ body {
   border: none;
   border-radius: var(--radius);
   cursor: pointer;
-  transition: all 0.15s;
+  transition: background-color 0.15s, transform 0.15s;
   min-width: 120px;
   min-height: 48px;
 }
@@ -313,6 +315,7 @@ body {
   border-color: var(--accent);
   color: var(--accent);
   animation: pulse 1.5s infinite;
+  will-change: opacity;
 }
 
 .step-line {

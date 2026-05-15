@@ -154,7 +154,7 @@ class MainActivity : AppCompatActivity() {
             WebView.setWebContentsDebuggingEnabled(true)
         }
         binding.webView.apply {
-            clearCache(true)
+            setLayerType(android.view.View.LAYER_TYPE_HARDWARE, null)
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.allowFileAccess = true
@@ -162,7 +162,7 @@ class MainActivity : AppCompatActivity() {
             settings.allowFileAccessFromFileURLs = true
             @Suppress("DEPRECATION")
             settings.allowUniversalAccessFromFileURLs = true
-            settings.cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE
+            settings.cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
             addJavascriptInterface(jsBridge, "OpenClaw")
             webViewClient =
                 object : WebViewClient() {
