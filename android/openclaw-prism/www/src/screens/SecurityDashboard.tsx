@@ -19,17 +19,21 @@ export function SecurityDashboard() {
   }, [])
 
   return (
-    <div className="page">
-      {/* Header */}
+    <div className="page security-page">
       <div className="security-header">
-        <div className="security-title">{t('sec_title')}</div>
-        <div className="status-pill active">{t('sec_active')}</div>
+        <div>
+          <div className="security-kicker">On-device monitor</div>
+          <div className="security-title">{t('sec_title')}</div>
+        </div>
+        <div className="status-pill active">
+          <span className="status-dot success" />
+          {t('sec_active')}
+        </div>
       </div>
       <div className="security-subtitle">
-        localhost:{status.sidecarPort} &bull; {t('sec_on_device')}
+        localhost:{status.sidecarPort} / {t('sec_on_device')}
       </div>
 
-      {/* Stat cards */}
       <div className="stat-row">
         <div className="stat-card stat-blocked">
           <div className="stat-value">{status.blocked}</div>
@@ -45,8 +49,10 @@ export function SecurityDashboard() {
         </div>
       </div>
 
-      {/* Live threat feed */}
-      <div className="section-title">{t('sec_live_feed')}</div>
+      <div className="feed-header">
+        <div className="section-title">{t('sec_live_feed')}</div>
+        <div className="feed-count">{feed.length} events</div>
+      </div>
 
       {feed.length === 0 ? (
         <div className="feed-empty">{t('sec_no_events')}</div>
@@ -63,17 +69,16 @@ export function SecurityDashboard() {
 
 function LogRow({ entry }: { entry: AuditEntry }) {
   const isBlock = entry.verdict === 'BLOCK'
-  const icon = isBlock ? '\u2717' : '\u2713'
   const time = new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 
   return (
     <div className={`log-row ${isBlock ? 'log-block' : 'log-allow'}`}>
-      <span className="log-icon">{icon}</span>
       <div className="log-content">
         <div className="log-meta">
           <span className={`log-path-badge ${isBlock ? 'badge-block' : 'badge-allow'}`}>
             {entry.path}
           </span>
+          <span className="log-verdict">{isBlock ? 'Blocked' : 'Allowed'}</span>
           <span className="log-time">{time}</span>
         </div>
         <div className="log-snippet">{entry.snippet.slice(0, 90)}</div>

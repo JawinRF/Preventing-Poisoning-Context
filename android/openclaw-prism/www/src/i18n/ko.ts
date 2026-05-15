@@ -1,7 +1,7 @@
 export const ko = {
-  tab_terminal: '🖥 터미널',
-  tab_dashboard: '📊 대시보드',
-  tab_settings: '⚙ 설정',
+  tab_terminal: '터미널',
+  tab_dashboard: '대시보드',
+  tab_settings: '설정',
 
   step_platform: '플랫폼',
   step_tools: '도구',

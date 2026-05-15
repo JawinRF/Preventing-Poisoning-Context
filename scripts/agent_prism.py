@@ -17,6 +17,12 @@ from datetime import datetime
 import requests
 import uiautomator2 as u2
 
+# Load API keys from project key files if not already in environment.
+_KEY_DIR = os.path.join(os.path.dirname(__file__), "..", "anthropic")
+_ANTHROPIC_KEY_FILE = os.path.join(_KEY_DIR, "api_key.txt")
+if not os.environ.get("ANTHROPIC_API_KEY") and os.path.isfile(_ANTHROPIC_KEY_FILE):
+    os.environ["ANTHROPIC_API_KEY"] = open(_ANTHROPIC_KEY_FILE).read().strip()
+
 from prism_client import PrismClient, NullPrismClient
 from context_assembler import ContextAssembler
 from defended_device import DefendedDevice
@@ -967,24 +973,33 @@ def _fail(reason: str) -> dict:
 # latency on dialog/confirmation screens.
 
 
-def check_obvious_actions(task: str, screen: list[dict], screen_changed: bool) -> dict | None:
-    """Return an action dict if the screen has an obvious button to tap, else None."""
+_OBVIOUS_BUTTONS = ("Got it", "Accept", "Allow", "Confirm")
+# "OK" and "Done" are intentionally excluded — they appear in pickers, forms,
+# and save dialogs where the LLM must fill values first. Only truly context-free
+# single-purpose confirmations qualify.
 
-    # If ANY input field exists this is a form — let the LLM decide what to do.
-    # This prevents auto-tapping Save/Create before the LLM fills in fields.
-    has_input_fields = any(e.get("input_field") for e in screen)
-    if has_input_fields:
+def check_obvious_actions(task: str, screen: list[dict], screen_changed: bool) -> dict | None:
+    """Return an action dict if the screen is a simple confirmation dialog, else None.
+
+    Conservative: only fires when:
+      1. No input fields present (not a form).
+      2. Screen is small (≤10 elements) — real confirmation dialogs; pickers/
+         calendars/forms have 15-30+ elements.
+      3. Button text is in the context-free set (not OK/Done which appear in
+         pickers and save dialogs).
+    """
+    if any(e.get("input_field") for e in screen):
         return None
 
-    # Only auto-tap simple confirmation dialogs (no input fields)
-    obvious_buttons = ("OK", "Done", "Confirm", "Accept", "Got it")
+    # Any screen with many elements is a picker, form, or list — skip.
+    if len(screen) > 10:
+        return None
 
     for elem in screen:
-        if elem.get("text") in obvious_buttons and "Button" in elem.get("class", ""):
-            if screen_changed or elem["text"] in ("OK", "Done", "Confirm", "Got it"):
-                logger.info(f"Obvious button: {elem['text']} — auto-tapping")
-                return {"thought": "obvious button", "action": "tap",
-                        "params": {"text": elem["text"]}}
+        if elem.get("text") in _OBVIOUS_BUTTONS and "Button" in elem.get("class", ""):
+            logger.info(f"Obvious button: {elem['text']} — auto-tapping")
+            return {"thought": "obvious button", "action": "tap",
+                    "params": {"text": elem["text"]}}
 
     return None
 
@@ -1472,10 +1487,14 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
             continue
         if prove_audit and PROVE_MODE == "shadow":
             shadow_dec = prove_audit.get("decision", "ALLOW")
-            if shadow_dec != "ALLOW":
-                # Mention shadow blocks so you see them during dev; doesn't change behavior.
-                print(f"  {YELLOW}[PROVE shadow] would {shadow_dec}: "
-                      f"{prove_audit.get('reason','')}{RESET}")
+            shadow_reason = prove_audit.get("reason", "")
+            if shadow_dec != "ALLOW" and shadow_reason != "insufficient_quorum":
+                # Only surface policy violations that aren't trivially caused by
+                # missing sidecar context (insufficient_quorum → always fires when
+                # sidecar is down; not indicative of an actual injection attempt).
+                print(f"  {YELLOW}[PROVE shadow] would {shadow_dec}: {shadow_reason}{RESET}")
+            else:
+                logger.debug("PROVE shadow %s: %s", shadow_dec, shadow_reason)
 
         result = dd.execute(action, params)
         print(f"  Result:  {result}")

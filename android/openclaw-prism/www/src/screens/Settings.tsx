@@ -1,5 +1,5 @@
 import { useRoute } from '../lib/router'
-import { t, getLocale, setLocale, availableLocales } from '../i18n'
+import { t } from '../i18n'
 
 interface MenuItem {
   icon: string
@@ -11,12 +11,12 @@ interface MenuItem {
 
 function getMenu(): MenuItem[] {
   return [
-    { icon: '📱', label: t('settings_platforms'), desc: t('settings_platforms_desc'), route: '/settings/platforms' },
-    { icon: '🔄', label: t('settings_updates'), desc: t('settings_updates_desc'), route: '/settings/updates', badge: false },
-    { icon: '⚡', label: t('settings_keep_alive'), desc: t('settings_keep_alive_desc'), route: '/settings/keep-alive' },
-    { icon: '🛡', label: t('settings_security'), desc: t('settings_security_desc'), route: '/settings/security' },
-    { icon: '💾', label: t('settings_storage'), desc: t('settings_storage_desc'), route: '/settings/storage' },
-    { icon: 'ℹ️', label: t('settings_about'), desc: t('settings_about_desc'), route: '/settings/about' },
+    { icon: 'PL', label: t('settings_platforms'), desc: t('settings_platforms_desc'), route: '/settings/platforms' },
+    { icon: 'UP', label: t('settings_updates'), desc: t('settings_updates_desc'), route: '/settings/updates', badge: false },
+    { icon: 'KA', label: t('settings_keep_alive'), desc: t('settings_keep_alive_desc'), route: '/settings/keep-alive' },
+    { icon: 'SC', label: t('settings_security'), desc: t('settings_security_desc'), route: '/settings/security' },
+    { icon: 'ST', label: t('settings_storage'), desc: t('settings_storage_desc'), route: '/settings/storage' },
+    { icon: 'AB', label: t('settings_about'), desc: t('settings_about_desc'), route: '/settings/about' },
   ]
 }
 
@@ -26,28 +26,6 @@ export function Settings() {
   return (
     <div className="page">
       <div className="page-title" style={{ marginBottom: 24 }}>{t('settings_title')}</div>
-      {/* Language selector */}
-      <div className="card" style={{ marginBottom: 16 }}>
-        <div className="card-row">
-          <span className="card-icon">🌐</span>
-          <div className="card-content">
-            <div className="card-label">Language</div>
-          </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            {availableLocales.map(loc => (
-              <button
-                key={loc.code}
-                className={`btn ${getLocale() === loc.code ? 'btn-primary' : ''}`}
-                style={{ padding: '4px 12px', fontSize: 13 }}
-                onClick={() => { setLocale(loc.code); window.location.reload() }}
-              >
-                {loc.label}
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-
       {getMenu().map(item => (
         <div key={item.route} className="card" onClick={() => navigate(item.route)}>
           <div className="card-row">

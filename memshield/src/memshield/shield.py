@@ -32,10 +32,7 @@ from .ragmask import compute_fragility
 from .authority import AuthorityScorer, AuthorityConfig
 from .progrank import compute_instability
 from .scorer import PoisonScorer, ScorerWeights, SignalVector, compute_copy_ratio
-from .config import (
-    _INJECTION_PATTERNS, _SUSPICIOUS_PATTERNS,
-    ShieldConfig,
-)
+from .config import ShieldConfig
 
 logger = logging.getLogger(__name__)
 
@@ -229,31 +226,6 @@ class MemShield:
                     layer_triggered="Layer0-Normalization",
                 )
 
-        # ── Layer 1: Injection patterns (high confidence → BLOCK) ────────
-        for pat in _INJECTION_PATTERNS:
-            if pat.search(scan_text):
-                return ShieldResult(
-                    verdict="BLOCK",
-                    confidence=0.97,
-                    reason=f"Injection pattern matched: {pat.pattern[:60]}",
-                    chunk_id=chunk_id,
-                    chunk_text=text,
-                    pattern_matched=pat.pattern,
-                    layer_triggered="Layer1-Regex",
-                )
-
-        # ── Layer 2: Suspicious patterns (medium confidence → QUARANTINE)
-        for pat in _SUSPICIOUS_PATTERNS:
-            if pat.search(scan_text):
-                return ShieldResult(
-                    verdict="QUARANTINE",
-                    confidence=0.72,
-                    reason=f"Suspicious pattern matched: {pat.pattern[:60]}",
-                    chunk_id=chunk_id,
-                    chunk_text=text,
-                    pattern_matched=pat.pattern,
-                    layer_triggered="Layer2-Regex",
-                )
 
         # ── Layer 3: Statistical anomaly ─────────────────────────────────
         if len(scan_text) > 2000:

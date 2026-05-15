@@ -35,6 +35,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Load Anthropic key from project key file if not in environment.
+_KEY_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "anthropic", "api_key.txt")
+if not os.environ.get("ANTHROPIC_API_KEY") and os.path.isfile(_KEY_FILE):
+    os.environ["ANTHROPIC_API_KEY"] = open(_KEY_FILE).read().strip()
+
 # Try requests; if unavailable the network backends raise on use.
 try:
     import requests  # type: ignore

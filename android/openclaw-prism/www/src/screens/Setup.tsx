@@ -234,7 +234,7 @@ export function Setup({ onComplete }: Props) {
           <div style={{ color: 'var(--error)', fontSize: 14, textAlign: 'center' }}>{error}</div>
         )}
 
-        <div className="tip-card">💡 {getTips()[tipIndex]}</div>
+        <div className="tip-card">{getTips()[tipIndex]}</div>
       </div>
     )
   }
@@ -243,7 +243,7 @@ export function Setup({ onComplete }: Props) {
   return (
     <div className="setup-container">
       {renderStepper()}
-      <div className="setup-logo">✅</div>
+      <div className="setup-logo">OK</div>
       <div className="setup-title">{t('setup_done_title')}</div>
       <div className="setup-subtitle">
         {t('setup_done_desc')}

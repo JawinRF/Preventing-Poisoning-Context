@@ -1,6 +1,6 @@
 from .shield import MemShield, ShieldResult
 from .audit import AuditLogger
-from .config import FailurePolicy, ShieldConfig, KeywordHeuristicStrategy
+from .config import FailurePolicy, ShieldConfig
 from .provenance import ContentHasher
 from .influence import compute_influence, InfluenceReport, InfluenceResult
 from .ragmask import compute_fragility, FragilityReport, FragilityResult
@@ -11,7 +11,7 @@ from .scorer import PoisonScorer, ScorerWeights, SignalVector, ScoringReport, co
 
 __all__ = [
     "MemShield", "ShieldResult", "AuditLogger",
-    "FailurePolicy", "ShieldConfig", "KeywordHeuristicStrategy",
+    "FailurePolicy", "ShieldConfig",
     "ContentHasher",
     "compute_influence", "InfluenceReport", "InfluenceResult",
     "compute_fragility", "FragilityReport", "FragilityResult",

@@ -12,28 +12,12 @@ interface PlatformInfo {
   name: string
 }
 
-function getCommands() {
-  return [
-    { label: 'Gateway', cmd: 'openclaw gateway', desc: t('cmd_gateway') },
-    { label: 'Status', cmd: 'openclaw status', desc: t('cmd_status') },
-    { label: 'Onboard', cmd: 'openclaw onboard', desc: t('cmd_onboard') },
-    { label: 'Logs', cmd: 'openclaw logs --follow', desc: t('cmd_logs') },
-  ]
-}
-
-function getManagement() {
-  return [
-    { label: 'Update', cmd: 'oa --update', desc: t('cmd_update') },
-    { label: 'Install Tools', cmd: 'oa --install', desc: t('cmd_install_tools') },
-  ]
-}
-
 export function Dashboard() {
   const [status, setStatus] = useState<BootstrapStatus | null>(null)
   const [platform, setPlatform] = useState<PlatformInfo | null>(null)
   const [runtimeInfo, setRuntimeInfo] = useState<Record<string, string>>({})
 
-  function refreshStatus() {
+  useEffect(() => {
     const bs = bridge.callJson<BootstrapStatus>('getBootstrapStatus')
     if (bs) setStatus(bs)
 
@@ -41,35 +25,19 @@ export function Dashboard() {
     if (ap) setPlatform(ap)
 
     const nodeV = bridge.callJson<{ stdout: string }>('runCommand', 'node -v 2>/dev/null')
-    const gitV = bridge.callJson<{ stdout: string }>('runCommand', 'git --version 2>/dev/null')
-    const ocV = bridge.callJson<{ stdout: string }>('runCommand', 'openclaw --version 2>/dev/null')
+    const ocV   = bridge.callJson<{ stdout: string }>('runCommand', 'openclaw --version 2>/dev/null')
     setRuntimeInfo({
-      'Node.js': nodeV?.stdout?.trim() || '—',
-      'git': gitV?.stdout?.trim()?.replace('git version ', '') || '—',
-      'openclaw': ocV?.stdout?.trim() || '—',
+      'Node.js':   nodeV?.stdout?.trim() || '—',
+      'openclaw':  ocV?.stdout?.trim()   || '—',
     })
-  }
-
-  useEffect(() => {
-    refreshStatus()
   }, [])
-
-  function runInTerminal(cmd: string) {
-    bridge.call('showTerminal')
-    bridge.call('writeToTerminal', '', cmd)
-  }
-
-
 
   if (!status?.installed) {
     return (
       <div className="page">
         <div className="setup-container" style={{ minHeight: 'calc(100vh - 80px)' }}>
-          <img src="./openclaw.svg" alt="OpenClaw" style={{ width: 64, height: 64, marginBottom: 4 }} />
           <div className="setup-title">{t('dash_setup_required')}</div>
-          <div className="setup-subtitle">
-            {t('dash_setup_desc')}
-          </div>
+          <div className="setup-subtitle">{t('dash_setup_desc')}</div>
         </div>
       </div>
     )
@@ -77,63 +45,28 @@ export function Dashboard() {
 
   return (
     <div className="page">
-      {/* Platform header */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 24 }}>
-        <img src="./openclaw.svg" alt="OpenClaw" style={{ width: 40, height: 40 }} />
-        <div>
-          <div style={{ fontSize: 20, fontWeight: 700 }}>
-            {platform?.name || 'OpenClaw'}
-          </div>
+      <div style={{ marginBottom: 28 }}>
+        <div style={{ fontSize: 12, fontWeight: 600, letterSpacing: '0.14em', textTransform: 'uppercase', color: 'var(--text-secondary)', marginBottom: 6 }}>
+          Agent
+        </div>
+        <div style={{ fontSize: 30, fontWeight: 700, lineHeight: 1 }}>
+          {platform?.name || 'OpenClaw'}
         </div>
       </div>
 
-      {/* Commands */}
-      <div className="section-title">{t('dash_commands')}</div>
-      <div className="card">
-        {getCommands().map((item, i) => (
-          <div
-            key={item.cmd}
-            className="card-row"
-            style={{ cursor: 'pointer', borderTop: i > 0 ? '1px solid var(--border)' : 'none', padding: '10px 0' }}
-            onClick={() => runInTerminal(item.cmd)}
-          >
-            <div className="card-content">
-              <div className="card-label">{item.label}</div>
-              <div className="card-desc" style={{ fontFamily: 'monospace', fontSize: 12 }}>{item.cmd}</div>
-            </div>
-            <div className="card-chevron">›</div>
-          </div>
-        ))}
-      </div>
-
-      {/* Runtime info */}
-      <div className="section-title">{t('dash_runtime')}</div>
-      <div className="card">
-        {Object.entries(runtimeInfo).map(([key, val]) => (
-          <div className="info-row" key={key}>
-            <span className="label">{key}</span>
-            <span>{val}</span>
-          </div>
-        ))}
-      </div>
-
-      {/* Management */}
-      <div className="section-title">{t('dash_management')}</div>
-      <div className="card">
-        {getManagement().map((item, i) => (
-          <div
-            key={item.cmd}
-            className="card-row"
-            style={{ cursor: 'pointer', borderTop: i > 0 ? '1px solid var(--border)' : 'none', padding: '10px 0' }}
-            onClick={() => runInTerminal(item.cmd)}
-          >
-            <div className="card-content">
-              <div className="card-label">{item.label}</div>
-              <div className="card-desc" style={{ fontFamily: 'monospace', fontSize: 12 }}>{item.cmd}</div>
-            </div>
-            <div className="card-chevron">›</div>
-          </div>
-        ))}
+      <div className="card" style={{ marginBottom: 20 }}>
+        <div className="info-row" style={{ borderBottom: '1px solid var(--border)' }}>
+          <span className="label">Status</span>
+          <span style={{ color: 'var(--success)', fontWeight: 600 }}>Running</span>
+        </div>
+        <div className="info-row" style={{ borderBottom: '1px solid var(--border)' }}>
+          <span className="label">Node.js</span>
+          <span>{runtimeInfo['Node.js']}</span>
+        </div>
+        <div className="info-row">
+          <span className="label">openclaw</span>
+          <span>{runtimeInfo['openclaw']}</span>
+        </div>
       </div>
     </div>
   )

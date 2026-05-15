@@ -109,11 +109,13 @@ class MainActivity : AppCompatActivity() {
             }
         }
         if (isInstalled) {
-            showTerminal()
+            // Create background session but stay on the WebView dashboard.
+            // Terminal is only shown if the user explicitly navigates to it.
             val session = sessionManager.createSession()
             if (bootstrapManager.needsPostSetup()) {
                 AppLogger.i(TAG, "Running post-setup script in terminal")
                 val script = bootstrapManager.postSetupScript.absolutePath
+                showTerminal()
                 binding.terminalView.post {
                     session.write("bash $script\n")
                 }

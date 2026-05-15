@@ -14,7 +14,7 @@ import { SettingsUpdates } from './screens/SettingsUpdates'
 import { SettingsPlatforms } from './screens/SettingsPlatforms'
 import { SettingsSecurity } from './screens/SettingsSecurity'
 
-type Tab = 'terminal' | 'dashboard' | 'security' | 'settings'
+type Tab = 'dashboard' | 'security' | 'settings'
 
 export function App() {
   const { path, navigate } = useRoute()
@@ -54,10 +54,6 @@ export function App() {
         : 'dashboard'
 
   function handleTabClick(tab: Tab) {
-    if (tab === 'terminal') {
-      bridge.call('showTerminal')
-      return
-    }
     bridge.call('showWebView')
     if (tab === 'dashboard') navigate('/dashboard')
     if (tab === 'security') navigate('/security')
@@ -74,12 +70,6 @@ export function App() {
     <>
       {/* Tab bar */}
       <nav className="tab-bar">
-        <button
-          className="tab-bar-item"
-          onClick={() => handleTabClick('terminal')}
-        >
-          {t('tab_terminal')}
-        </button>
         <button
           className={`tab-bar-item ${activeTab === 'dashboard' ? 'active' : ''}`}
           onClick={() => handleTabClick('dashboard')}

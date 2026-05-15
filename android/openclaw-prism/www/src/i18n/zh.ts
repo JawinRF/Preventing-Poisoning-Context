@@ -1,7 +1,7 @@
 export const zh = {
-  tab_terminal: '🖥 终端',
-  tab_dashboard: '📊 仪表盘',
-  tab_settings: '⚙ 设置',
+  tab_terminal: '终端',
+  tab_dashboard: '仪表盘',
+  tab_settings: '设置',
 
   step_platform: '平台',
   step_tools: '工具',

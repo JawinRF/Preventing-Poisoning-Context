@@ -1,8 +1,8 @@
 export const en = {
   // App tab bar
-  tab_terminal: '🖥 Terminal',
-  tab_dashboard: '📊 Dashboard',
-  tab_settings: '⚙ Settings',
+  tab_terminal: 'Terminal',
+  tab_dashboard: 'Dashboard',
+  tab_settings: 'Settings',
 
   // Setup - steps
   step_platform: 'Platform',
@@ -131,12 +131,12 @@ export const en = {
 
   // Security Dashboard
   sec_title: 'PRISM Shield',
-  sec_active: 'ACTIVE',
+  sec_active: 'Live',
   sec_on_device: 'On-device sidecar',
-  sec_blocked: 'BLOCKED',
-  sec_allowed: 'ALLOWED',
-  sec_total: 'TOTAL',
-  sec_live_feed: 'LIVE THREAT FEED',
+  sec_blocked: 'Blocked',
+  sec_allowed: 'Allowed',
+  sec_total: 'Total',
+  sec_live_feed: 'Live feed',
   sec_no_events: 'No events yet. Waiting for input\u2026',
 
   // Security Settings

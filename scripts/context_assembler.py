@@ -24,7 +24,6 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from prism_client import PrismClient
-from shared_patterns import INJECTION_PATTERNS
 
 logger = logging.getLogger(__name__)
 
@@ -538,20 +537,13 @@ class ContextAssembler:
         if not elements:
             return [], 0
 
-        # Lightweight Layer 1 regex scan — annotate, never hide
+        # Regex injection scan intentionally removed from UI elements.
+        # UI text comes from the device's own apps — not untrusted external input.
+        # Regex produces constant false positives on normal app labels ("New task",
+        # "Confirm", "Send") with zero real catches. The ML pipeline (TinyBERT /
+        # DeBERTa) and PROVE gate handle real injection threats in the paths that
+        # actually matter: SMS, notifications, clipboard, RAG.
         warned_count = 0
-        for elem in elements:
-            elem_text = f"{elem.get('text', '')} {elem.get('desc', '')}".strip()
-            if not elem_text:
-                continue
-            for pattern in INJECTION_PATTERNS:
-                if pattern.search(elem_text):
-                    elem["prism_warning"] = "potential_injection"
-                    warned_count += 1
-                    logger.warning(
-                        f"UI element annotated (L1 regex): '{elem_text[:60]}'"
-                    )
-                    break
 
         # If a WebView is present, read its content via Chrome DevTools Protocol
         has_webview = any(
