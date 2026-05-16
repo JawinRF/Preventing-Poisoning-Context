@@ -72,9 +72,10 @@ PRIOR_CLEAN    = 0.60   # auto-memory: clean context, no T3 in session
 PRIOR_T3       = 0.35   # auto-memory: T3 source was in context during run
 PRIOR_FLAGGED  = 0.15   # auto-memory: Stage-1 causal-overlap tripped → audit-only
 AUDIT_FLOOR    = 0.10   # tombstoned memories: row kept, trust floored, not retrievable
-CORROB_GAMMA   = 0.50   # graduation factor: trust ← 1-(1-trust)·γ per corroboration
-EDGE_ATTEN     = 0.90   # per-edge attenuation for BFS — replaces 1/N dilution
-RETRIEVAL_BETA = 1.00   # effective_score = cosine_sim × trust^β at retrieval
+CORROB_GAMMA       = 0.50   # graduation factor: trust ← 1-(1-trust)·γ per corroboration
+CORROB_SIM_THRESH  = 0.70   # cosine similarity floor for auto-corroboration
+EDGE_ATTEN         = 0.90   # per-edge attenuation for BFS — replaces 1/N dilution
+RETRIEVAL_BETA     = 1.00   # effective_score = cosine_sim × trust^β at retrieval
 
 
 # ── T3 fingerprint helper ─────────────────────────────────────────────────────
@@ -376,6 +377,24 @@ class LineageGraph:
             (session_id,),
         ).fetchall()
         return [r[0] for r in rows if r[0]]
+
+    def get_session_t3_sources(self, session_id: str) -> list[tuple[str, str]]:
+        """Return (fingerprint, description) pairs for T3 sources in this session."""
+        rows = self._conn.execute(
+            """SELECT r.doc_id, COALESCE(t.description, '') FROM retrievals r
+               JOIN t3_meta t ON t.fingerprint = r.doc_id
+               WHERE r.session_id = ? AND r.doc_id LIKE 't3:%'""",
+            (session_id,),
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def get_session_retrieved_ids(self, session_id: str) -> set[str]:
+        """ChromaDB doc IDs (not T3) retrieved in this session."""
+        rows = self._conn.execute(
+            "SELECT doc_id FROM retrievals WHERE session_id=? AND doc_id NOT LIKE 't3:%'",
+            (session_id,),
+        ).fetchall()
+        return {r[0] for r in rows}
 
     def get_session_parent_trusts(self, session_id: str, collection) -> list[float]:
         """Trust scores of all ChromaDB docs (not T3) retrieved in this session."""

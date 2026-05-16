@@ -73,6 +73,42 @@ def compute_birth_prior(
     return False
 
 
+def get_causal_t3_fps(
+    memory_text: str,
+    task: str,
+    t3_fingerprints: list[str],
+    t3_texts: list[str],
+) -> list[str]:
+    """Return T3 fingerprints whose text has high causal overlap with memory_text.
+
+    Used by Stage-2 auto-tombstone to identify WHICH T3 sources authored the
+    drift before flagging them via flag_t3_source().
+    """
+    if not t3_fingerprints:
+        return []
+
+    mem_words  = _tokenise(memory_text)
+    task_words = _tokenise(task)
+    novel      = mem_words - task_words
+
+    if len(novel) < _MIN_NOVEL_WORDS:
+        return []
+
+    flagging = []
+    for fp, text in zip(t3_fingerprints, t3_texts):
+        t3_words = _tokenise(text)
+        if not t3_words:
+            continue
+        overlap = len(novel & t3_words) / max(len(novel), len(t3_words))
+        if overlap >= CAUSAL_OVERLAP_THRESHOLD:
+            logger.warning(
+                f"[Provenance] T3 source {fp} causal overlap {overlap:.2f} — "
+                f"flagging as drift author"
+            )
+            flagging.append(fp)
+    return flagging
+
+
 def run_stage2_counterfactual(
     memory_text: str,
     task: str,

@@ -25,6 +25,10 @@ _agent: Any = None
 _alert_queue:   _queue_mod.Queue = _queue_mod.Queue()
 _alert_watcher: Any = None   # AlertWatcher instance
 
+# Memory lineage graph — initialised in repl().
+_lineage:        Any = None   # LineageGraph instance
+_lineage_session: str = ""    # current REPL session ID
+
 def _get_agent():
     global _agent
     if _agent is None:
@@ -372,11 +376,17 @@ def _memory(args: list[str]) -> None:
         # Go through MemShield so the memory gets a valid HMAC provenance seal.
         # Poisoned docs injected directly into ChromaDB won't have this seal
         # and will be flagged by the retrieval-time defense.
+        # origin="user" + trust_score=1.0 — user-vouched: exempt from provisional
+        # birth-prior machinery, soft rerank is a no-op (trust^β = 1.0).
+        _user_meta = {
+            "source": "memory", "name": doc_id, "ts": ts,
+            "origin": "user", "trust_score": 1.0,
+        }
         shield = _rag_shield(col)
         if shield:
             stats = shield.ingest_with_scan(
                 documents=[doc], ids=[doc_id],
-                metadatas=[{"source": "memory", "name": doc_id, "ts": ts}],
+                metadatas=[_user_meta],
                 source="memory", authority=0.5,
             )
             if stats["blocked"]:
@@ -386,9 +396,13 @@ def _memory(args: list[str]) -> None:
                 print(f"{YLW}  PRISM quarantined memory — content suspicious, not stored{R}")
                 return
         else:
-            col.upsert(documents=[doc], ids=[doc_id],
-                       metadatas=[{"source": "memory", "name": doc_id, "ts": ts}])
+            col.upsert(documents=[doc], ids=[doc_id], metadatas=[_user_meta])
         print(f"{GRN}  memory saved{R}  {DIM}{doc[:80]}{R}")
+        # Record lineage: new memory inherits all docs retrieved this session as parents.
+        if _lineage and _lineage_session:
+            n_parents = _lineage.record_save(_lineage_session, doc_id)
+            if n_parents:
+                print(f"  {DIM}lineage: {n_parents} parent(s) linked{R}")
 
     elif sub in ("del", "delete"):
         if len(args) < 2:
@@ -412,8 +426,62 @@ def _memory(args: list[str]) -> None:
             col.delete(ids=ids)
         print(f"{YLW}  {len(ids)} memories cleared{R}")
 
+    elif sub == "lineage":
+        # /memory lineage [doc_id|flag-source <fp>]
+        if not _lineage:
+            print(f"{RED}  lineage graph not available{R}"); return
+
+        # /memory lineage flag-source <fingerprint>
+        if len(args) >= 2 and args[1] == "flag-source":
+            if len(args) < 3:
+                print(f"{RED}  /memory lineage flag-source <t3:...fingerprint>{R}"); return
+            fp  = args[2]
+            col = col   # already fetched above
+            n   = _lineage.flag_t3_source(fp, 0.7, col)
+            print(f"{YLW}  T3 source {fp} flagged — {n} memory/memories penalised{R}")
+            return
+
+        s = _lineage.stats()
+        print(
+            f"\n  Lineage graph: {s['edges']} edge(s), {s['sessions']} session(s), "
+            f"{s['t3_sources']} T3 source(s) ({s['t3_flagged']} flagged)"
+        )
+        if len(args) >= 2:
+            target = args[1]
+            # resolve partial ID
+            all_results = col.get(where={"source": "memory"}, include=["metadatas"])
+            full_id = next((i for i in (all_results.get("ids") or []) if i.startswith(target)), None)
+            if not full_id:
+                print(f"{RED}  no memory with id starting '{target}'{R}"); return
+            trust   = _lineage.get_trust(full_id, col)
+            parents = _lineage.get_parents(full_id)
+            children = _lineage.get_children(full_id)
+            bar = f"{GRN}" if trust >= 0.7 else (f"{YLW}" if trust >= 0.3 else f"{RED}")
+            print(f"\n  {full_id}  trust={bar}{trust:.3f}{R}")
+            print(f"  Parents  ({len(parents)}): " +
+                  (", ".join(f"{p[:12]}(w={w:.2f})" for p, w in parents) or "none"))
+            print(f"  Children ({len(children)}): " +
+                  (", ".join(f"{c[:12]}(w={w:.2f})" for c, w in children[:5]) or "none"))
+        else:
+            # Show trust overview for all memories
+            all_results = col.get(where={"source": "memory"}, include=["documents", "metadatas"])
+            ids   = all_results.get("ids", [])
+            docs  = all_results.get("documents", [])
+            metas = all_results.get("metadatas", [])
+            if not ids:
+                print(f"  {DIM}no memories{R}"); return
+            print(f"\n  {'ID':<16} {'TRUST':<8} PREVIEW")
+            print(f"  {'─'*60}")
+            for mid, doc, meta in zip(ids, docs, metas or []):
+                trust  = float((meta or {}).get("trust_score", 1.0))
+                bar    = f"{GRN}" if trust >= 0.7 else (f"{YLW}" if trust >= 0.3 else f"{RED}")
+                n_ch   = len(_lineage.get_children(mid))
+                ch_tag = f" {DIM}({n_ch} child(ren)){R}" if n_ch else ""
+                print(f"  {mid:<16} {bar}{trust:.3f}{R}{ch_tag}  {DIM}{doc[:50]}{R}")
+        print()
+
     else:
-        print(f"{RED}  /memory list | save <text> | del <index> | clear{R}")
+        print(f"{RED}  /memory list | save <text> | del <index> | clear | lineage [id]{R}")
 
 
 # ── Chat with Claude ────────────────────────────────────────────────────────
@@ -784,6 +852,23 @@ def repl(llm: str = "groq", serial: str = DEFAULT_SERIAL) -> None:
         )
     except Exception:
         pass   # if ADB is unavailable the watcher backs off gracefully
+
+    # Initialise memory lineage graph.
+    global _lineage, _lineage_session
+    try:
+        from memory_lineage import LineageGraph, set_active
+        _lineage_path    = pathlib.Path(_HERE).parent / "data" / "memory_lineage.db"
+        _lineage         = LineageGraph(_lineage_path)
+        _lineage_session = _lineage.start_session()
+        set_active(_lineage, _lineage_session)
+        s = _lineage.stats()
+        print(
+            f"{DIM}  lineage graph ready — "
+            f"{s['edges']} edge(s) across {s['sessions']} session(s){R}"
+        )
+    except Exception as _exc:
+        print(f"{DIM}  lineage graph unavailable: {_exc}{R}")
+        _lineage = None
 
     # Start background alert watcher.
     from alert_watcher import AlertWatcher

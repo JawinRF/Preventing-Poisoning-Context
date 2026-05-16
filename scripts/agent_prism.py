@@ -43,18 +43,22 @@ try:
     from memory_lineage import (
         get_active,
         PRIOR_CLEAN, PRIOR_T3, PRIOR_FLAGGED, AUDIT_FLOOR, EDGE_ATTEN,
+        T3_SUSPICION, CORROB_SIM_THRESH,
     )
-    from memory_provenance import compute_birth_prior
+    from memory_provenance import compute_birth_prior, get_causal_t3_fps
     _LINEAGE_AVAILABLE = True
 except ImportError:
     _LINEAGE_AVAILABLE = False
     def get_active():       return None, ""
-    PRIOR_CLEAN   = 0.60
-    PRIOR_T3      = 0.35
-    PRIOR_FLAGGED = 0.15
-    AUDIT_FLOOR   = 0.10
-    EDGE_ATTEN    = 0.90
-    def compute_birth_prior(*a, **kw): return False
+    PRIOR_CLEAN       = 0.60
+    PRIOR_T3          = 0.35
+    PRIOR_FLAGGED     = 0.15
+    AUDIT_FLOOR       = 0.10
+    EDGE_ATTEN        = 0.90
+    T3_SUSPICION      = 0.70
+    CORROB_SIM_THRESH = 0.70
+    def compute_birth_prior(*a, **kw):  return False
+    def get_causal_t3_fps(*a, **kw):    return []
 
 
 # ── MemShield embedder/generator helpers ─────────────────────────────────────
@@ -1239,6 +1243,57 @@ def _setup_rag(enable_prism: bool, installed_apps: list[dict] | None = None) -> 
         return None
 
 
+def _auto_corroborate(
+    shield: "MemShield",
+    new_doc_id: str,
+    summary: str,
+    lineage,
+    session_id: str,
+) -> None:
+    """After a clean auto-save, check if any existing provisional memories were
+    independently re-derived this session and should be corroborated.
+
+    A provisional memory qualifies if:
+      1. origin='auto' and trust < PRIOR_CLEAN (not yet graduated)
+      2. Was NOT retrieved in this session (independent derivation, not recall)
+      3. Is semantically similar to the newly saved memory (cosine sim >= CORROB_SIM_THRESH)
+    """
+    if not (shield and shield.collection and lineage and session_id):
+        return
+    try:
+        retrieved_ids = lineage.get_session_retrieved_ids(session_id)
+
+        similar = shield.collection.query(
+            query_texts=[summary], n_results=6,
+            where={"source": "memory"},
+            include=["metadatas", "ids", "distances"],
+        )
+        cand_ids   = similar.get("ids",       [[]])[0]
+        cand_metas = similar.get("metadatas", [[]])[0]
+        cand_dists = similar.get("distances", [[]])[0]
+
+        for cid, cmeta, dist in zip(cand_ids, cand_metas, cand_dists):
+            if cid == new_doc_id:
+                continue
+            if cid in retrieved_ids:
+                continue  # retrieved → lineage parent, not independent re-derivation
+            cmeta = cmeta or {}
+            if cmeta.get("origin", "user") != "auto":
+                continue
+            trust = float(cmeta.get("trust_score", 1.0))
+            if trust >= PRIOR_CLEAN:
+                continue  # already graduated
+            similarity = max(0.0, 1.0 - dist)
+            if similarity >= CORROB_SIM_THRESH:
+                new_trust = lineage.corroborate(cid, shield.collection)
+                logger.info(
+                    f"[Provenance] {cid[:12]} independently re-derived "
+                    f"(sim={similarity:.2f}) — corroborated trust→{new_trust:.3f}"
+                )
+    except Exception as exc:
+        logger.warning(f"[Provenance] auto-corroborate failed: {exc}")
+
+
 def _record_experience(
     shield: "MemShield", task: str, history: "ActionHistory", summary: str,
     outcome: str = "success",
@@ -1282,15 +1337,16 @@ def _record_experience(
     # ── Provenance-based birth prior (autonomous path only) ───────────────
     lineage, session_id = get_active()
 
-    t3_count    = lineage.get_session_t3_count(session_id)    if (lineage and session_id) else 0
-    t3_texts    = lineage.get_session_t3_texts(session_id)    if (lineage and session_id) else []
+    t3_sources  = lineage.get_session_t3_sources(session_id) if (lineage and session_id) else []
+    t3_fps      = [fp  for fp, _   in t3_sources]
+    t3_texts    = [txt for _,  txt in t3_sources]
     par_trusts  = lineage.get_session_parent_trusts(session_id, shield.collection) \
                   if (lineage and session_id and shield.collection) else []
 
     # Context-based prior: worse if T3 was in context
-    context_prior = PRIOR_T3 if t3_count > 0 else PRIOR_CLEAN
+    context_prior = PRIOR_T3 if t3_fps else PRIOR_CLEAN
 
-    # Stage-1: causal overlap → audit-only prior
+    # Stage-1: causal overlap → audit-only prior + Stage-2 auto-tombstone trigger
     stage1_flagged = compute_birth_prior(summary, task, t3_texts)
     if stage1_flagged:
         context_prior = PRIOR_FLAGGED
@@ -1303,7 +1359,7 @@ def _record_experience(
 
     logger.info(
         f"[Provenance] auto-memory birth trust={birth_trust:.2f} "
-        f"(t3={t3_count}, stage1_flagged={stage1_flagged}, "
+        f"(t3={len(t3_fps)}, stage1_flagged={stage1_flagged}, "
         f"parents={len(par_trusts)})"
     )
 
@@ -1324,6 +1380,24 @@ def _record_experience(
                 logger.info(
                     f"[Lineage] auto-memory {doc_id[:12]} ← {n_parents} parent(s)"
                 )
+
+            if stage1_flagged:
+                # Stage-2: auto-tombstone + flag the T3 sources that authored the drift.
+                # Memory is kept for audit (tombstone) but driven below AUDIT_FLOOR.
+                if lineage and shield.collection:
+                    lineage.tombstone(doc_id, shield.collection)
+                causal_fps = get_causal_t3_fps(summary, task, t3_fps, t3_texts)
+                for fp in causal_fps:
+                    if lineage and shield.collection:
+                        lineage.flag_t3_source(fp, T3_SUSPICION, shield.collection)
+                        logger.warning(
+                            f"[Provenance] Stage-2 flagged T3 source {fp} "
+                            f"(retroactive suspicion propagated)"
+                        )
+            else:
+                # Auto-corroborate: check if existing provisional memories were
+                # independently re-derived this session (no retrieval → graduation).
+                _auto_corroborate(shield, doc_id, summary, lineage, session_id)
     except Exception as e:
         logger.warning(f"Memory recording failed: {e}")
 
