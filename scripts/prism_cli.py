@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import pathlib
+import queue as _queue_mod
 import re
 import readline
 import shlex
@@ -18,6 +20,10 @@ if _HERE not in sys.path:
 # agent_prism takes ~5 s to import (uiautomator2, transformers, anthropic).
 # Defer it until the first actual task execution.
 _agent: Any = None
+
+# Alert watcher — background thread + queue, both set up in repl().
+_alert_queue:   _queue_mod.Queue = _queue_mod.Queue()
+_alert_watcher: Any = None   # AlertWatcher instance
 
 def _get_agent():
     global _agent
@@ -498,6 +504,238 @@ def _chat(text: str) -> None:
         _session_history.pop()  # remove the user message on failure
 
 
+# ── Alert watcher helpers ────────────────────────────────────────────────────
+
+def _drain_alerts(llm: str, serial: str) -> None:
+    """Drain the alert queue and display/execute pending items.
+
+    Called at the top of every REPL iteration — BEFORE input() blocks —
+    so alerts never corrupt the user's active readline input line.
+
+    Each item can be:
+      "alert"  — print a highlighted message to the terminal.
+      "auto"   — print then synchronously run the agent task.
+      "burst"  — coalesced summary when > _BURST_THRESHOLD items fired in one tick.
+    """
+    items: list[dict] = []
+    while True:
+        try:
+            items.append(_alert_queue.get_nowait())
+        except _queue_mod.Empty:
+            break
+
+    if not items:
+        return
+
+    _ts = lambda: time.strftime("%H:%M:%S")
+    print()   # blank line separates alerts from previous output
+
+    for item in items:
+        kind = item.get("kind")
+
+        if kind == "alert":
+            notif = item.get("notif", {})
+            print(f"{YLW}{B}  ⚡ [ALERT]{R} {item['msg']}")
+            print(f"  {DIM}rule:{item['rule_id']} | {notif.get('package','?')} | {_ts()}{R}")
+
+        elif kind == "auto":
+            notif = item.get("notif", {})
+            task  = item["task"]
+            print(f"{CYN}{B}  ⚡ [AUTO-RUN]{R} {task}")
+            print(
+                f"  {DIM}rule:{item['rule_id']} | "
+                f"[{notif.get('package','')}] {notif.get('title','')}{R}"
+            )
+            print()
+            try:
+                _run(task, llm, serial)
+            except Exception as exc:
+                print(f"{RED}  auto-run failed: {exc}{R}")
+
+        elif kind == "burst":
+            print(f"{YLW}{B}  ⚡ [ALERT BURST]{R} {item['msg']}")
+            for sub in item.get("items", [])[:_BURST_PREVIEW]:
+                preview = sub.get("msg") or sub.get("task", "")
+                print(f"  {DIM}  • [{sub['kind']}] {preview[:70]}{R}")
+            overflow = len(item.get("items", [])) - _BURST_PREVIEW
+            if overflow > 0:
+                print(f"  {DIM}  … and {overflow} more{R}")
+
+    print()   # blank line after alert block
+
+
+_BURST_PREVIEW = 3   # lines shown in a burst summary
+
+
+def _alert(args: list[str], llm: str, serial: str) -> None:
+    """Handler for /alert — manage background notification trigger rules.
+
+    Subcommands:
+      /alert add "condition" → "message {title}"
+      /alert add "condition" → auto: "task for agent {text}"
+      /alert list
+      /alert del  <rule-id>
+      /alert pause <rule-id>
+      /alert resume <rule-id>
+      /alert test "condition" [package] [title] [text]
+      /alert status
+      /alert reload
+
+    Condition DSL (case-insensitive substring, AND/OR/NOT):
+      package:com.google.android.gm
+      title:Alice AND text:meeting
+      text:OTP OR text:verification
+      NOT title:advertisement
+      app:gmail                          (friendly name → package lookup)
+      any:urgent                         (searches all fields)
+
+    Template variables in action string: {package}, {title}, {text}, {app}
+    """
+    global _alert_watcher
+
+    if _alert_watcher is None:
+        print(f"{RED}  alert watcher not initialised — start the CLI normally{R}")
+        return
+
+    sub = args[1] if len(args) > 1 else "list"
+
+    # ── add ───────────────────────────────────────────────────────────────────
+    if sub == "add":
+        if len(args) < 3:
+            print(f"{RED}  /alert add \"condition\" → \"action\"{R}")
+            print(f"  {DIM}alert:    → \"Email: {{title}}\"{R}")
+            print(f"  {DIM}auto-run: → auto: \"Read email from {{title}} and reply\"{R}")
+            return
+
+        raw = " ".join(args[2:])
+
+        # Locate → or -> separator
+        sep_char = "→" if "→" in raw else ("->" if "->" in raw else None)
+        if sep_char is None:
+            print(f"{RED}  Missing → separator.  Example: /alert add \"text:OTP\" → \"OTP: {{text}}\"{R}")
+            return
+
+        condition_str, _, action_str = raw.partition(sep_char)
+        condition_str = condition_str.strip().strip("\"'")
+        action_str    = action_str.strip().strip("\"'")
+
+        if not condition_str:
+            print(f"{RED}  Condition cannot be empty{R}"); return
+        if not action_str:
+            print(f"{RED}  Action cannot be empty{R}"); return
+
+        # Parse action type
+        if re.match(r'^auto\s*:', action_str, re.IGNORECASE):
+            action_type = "auto"
+            action      = re.sub(r'^auto\s*:\s*', '', action_str, flags=re.IGNORECASE).strip("\"'")
+        else:
+            action_type = "alert"
+            action      = action_str
+
+        # Optional --rate N flag
+        rate = 3
+        if "--rate" in args:
+            idx = args.index("--rate")
+            try:
+                rate = max(1, int(args[idx + 1]))
+            except (ValueError, IndexError):
+                print(f"{RED}  --rate requires an integer (e.g. --rate 5){R}"); return
+
+        try:
+            rule = _alert_watcher.add_rule(condition_str, action_type, action, rate)
+        except ValueError as exc:
+            print(f"{RED}  {exc}{R}"); return
+
+        print(f"{GRN}  rule added{R}  {DIM}id:{rule.id}{R}")
+        print(f"  {DIM}condition : {condition_str}{R}")
+        print(f"  {DIM}action    : [{action_type}] {action}{R}")
+        print(f"  {DIM}rate limit: {rate}/min{R}")
+
+    # ── list ──────────────────────────────────────────────────────────────────
+    elif sub == "list":
+        rules = _alert_watcher.get_rules()
+        if not rules:
+            print(f"  {DIM}no alert rules  —  add one with /alert add{R}")
+            return
+        print(f"\n  {'ID':<13} {'ON':<4} {'#':<6} {'TYPE':<7}  {'CONDITION  →  ACTION'}")
+        print(f"  {'─' * 72}")
+        for r in rules:
+            on  = f"{GRN}✓{R}" if r.enabled else f"{RED}✗{R}"
+            tag = f"{CYN}auto{R}" if r.action_type == "auto" else "alrt"
+            cond   = r.condition[:32]
+            action = r.action[:28]
+            print(f"  {r.id:<13} {on}   {r.fire_count:<6} {tag:<7}  "
+                  f"{DIM}{cond}  →  {action}{R}")
+        print()
+
+    # ── del ───────────────────────────────────────────────────────────────────
+    elif sub in ("del", "delete", "rm"):
+        if len(args) < 3:
+            print(f"{RED}  /alert del <rule-id>{R}"); return
+        rid = args[2]
+        if _alert_watcher.del_rule(rid):
+            print(f"{GRN}  rule {rid} removed{R}")
+        else:
+            print(f"{RED}  rule not found: {rid!r}{R}")
+
+    # ── pause / resume ────────────────────────────────────────────────────────
+    elif sub == "pause":
+        if len(args) < 3:
+            print(f"{RED}  /alert pause <rule-id>{R}"); return
+        if _alert_watcher.set_enabled(args[2], False):
+            print(f"{YLW}  rule {args[2]} paused{R}")
+        else:
+            print(f"{RED}  rule not found{R}")
+
+    elif sub == "resume":
+        if len(args) < 3:
+            print(f"{RED}  /alert resume <rule-id>{R}"); return
+        if _alert_watcher.set_enabled(args[2], True):
+            print(f"{GRN}  rule {args[2]} resumed{R}")
+        else:
+            print(f"{RED}  rule not found{R}")
+
+    # ── test ──────────────────────────────────────────────────────────────────
+    elif sub == "test":
+        # /alert test "condition" [package] [title] [text]
+        if len(args) < 3:
+            print(f"{RED}  /alert test \"condition\" [package] [title] [text]{R}")
+            return
+        cond    = args[2].strip("\"'")
+        package = args[3].strip("\"'") if len(args) > 3 else ""
+        title   = args[4].strip("\"'") if len(args) > 4 else ""
+        text    = args[5].strip("\"'") if len(args) > 5 else ""
+        try:
+            matches = _alert_watcher.test_condition(cond, package, title, text)
+        except Exception as exc:
+            print(f"{RED}  error: {exc}{R}"); return
+        mark = f"{GRN}MATCH ✓{R}" if matches else f"{RED}no match ✗{R}"
+        print(f"  {mark}")
+        print(f"  {DIM}package={package!r}  title={title!r}  text={text!r}{R}")
+
+    # ── status ────────────────────────────────────────────────────────────────
+    elif sub == "status":
+        rules  = _alert_watcher.get_rules()
+        active = sum(1 for r in rules if r.enabled)
+        paused = len(rules) - active
+        total_fires = sum(r.fire_count for r in rules)
+        print(f"  Watcher : {GRN}RUNNING{R}  poll every {_POLL_INTERVAL}s")
+        print(f"  Rules   : {active} active, {paused} paused  ({len(rules)} total)")
+        print(f"  Fires   : {total_fires} total across all rules")
+        print(f"  Rules   : {_alert_watcher._rules_path}")
+
+    # ── reload ────────────────────────────────────────────────────────────────
+    elif sub == "reload":
+        n = _alert_watcher.reload_rules()
+        print(f"{GRN}  {n} rule(s) loaded from disk{R}")
+
+    else:
+        print(f"  /alert  add | list | del | pause | resume | test | status | reload")
+
+
+_POLL_INTERVAL = 5   # exported so _drain_alerts can reference it
+
+
 # ── Dispatch table ──────────────────────────────────────────────────────────
 
 _DISPATCH: dict[str, Any] = {
@@ -508,6 +746,7 @@ _DISPATCH: dict[str, Any] = {
     "routine": _routine,
     "skill":   lambda args, llm, serial: _skill(args),
     "memory":  lambda args, llm, serial: _memory(args),
+    "alert":   _alert,
     "watch":   lambda args, llm, serial: _watch(llm, serial),
     "status":  lambda args, llm, serial: _status(),
     "help":    lambda args, llm, serial: print(HELP),
@@ -530,46 +769,85 @@ def _launch_openclaw(serial: str) -> None:
 
 
 def repl(llm: str = "groq", serial: str = DEFAULT_SERIAL) -> None:
+    global _alert_watcher
+
     print(BANNER)
     _launch_openclaw(serial)
+
+    # Ensure ADB port-forward is in place before the alert watcher starts polling.
+    # ContextAssembler sets this up per-run; we need it earlier for the watcher.
+    import subprocess as _sp
+    try:
+        _sp.run(
+            ["adb", "-s", serial, "forward", "tcp:8766", "tcp:8766"],
+            capture_output=True, timeout=5,
+        )
+    except Exception:
+        pass   # if ADB is unavailable the watcher backs off gracefully
+
+    # Start background alert watcher.
+    from alert_watcher import AlertWatcher
+    _rules_path = pathlib.Path(_HERE).parent / "data" / "alert_rules.json"
+    _alert_watcher = AlertWatcher(
+        serial=serial,
+        alert_queue=_alert_queue,
+        rules_path=_rules_path,
+    )
+    _alert_watcher.start()
+    n_rules = len(_alert_watcher.get_rules())
+    print(
+        f"{DIM}  alert watcher started — "
+        f"{n_rules} rule(s) | poll every 5s | "
+        f"/alert add to create triggers{R}"
+    )
+
     try:
         readline.read_history_file(HISTORY)
     except FileNotFoundError:
         pass
     readline.set_history_length(500)
 
-    while True:
-        try:
-            line = input(PROMPT).strip()
-        except (EOFError, KeyboardInterrupt):
-            print(); break
+    try:
+        while True:
+            # Drain alert queue BEFORE showing prompt — never mid-keypress.
+            _drain_alerts(llm, serial)
 
-        if not line:
-            continue
-
-        if line.startswith("/"):
             try:
-                parts = shlex.split(line[1:])
-            except ValueError as e:
-                print(f"{RED}  parse error: {e}{R}"); continue
-            if not parts:
+                line = input(PROMPT).strip()
+            except (EOFError, KeyboardInterrupt):
+                print(); break
+
+            if not line:
                 continue
-            cmd, *args = parts
-            if cmd in ("exit", "quit"):
-                break
-            handler = _DISPATCH.get(cmd)
-            if handler:
+
+            if line.startswith("/"):
                 try:
-                    handler(args, llm, serial)
+                    parts = shlex.split(line[1:])
+                except ValueError as e:
+                    print(f"{RED}  parse error: {e}{R}"); continue
+                if not parts:
+                    continue
+                cmd, *args = parts
+                if cmd in ("exit", "quit"):
+                    break
+                handler = _DISPATCH.get(cmd)
+                if handler:
+                    try:
+                        handler(args, llm, serial)
+                    except KeyboardInterrupt:
+                        print(f"\n{YLW}  interrupted{R}")
+                else:
+                    print(f"{RED}  unknown /{cmd} — try /help{R}")
+            else:
+                try:
+                    _chat(line)
                 except KeyboardInterrupt:
                     print(f"\n{YLW}  interrupted{R}")
-            else:
-                print(f"{RED}  unknown /{cmd} — try /help{R}")
-        else:
-            try:
-                _chat(line)
-            except KeyboardInterrupt:
-                print(f"\n{YLW}  interrupted{R}")
+    finally:
+        # Graceful shutdown: flush fire counts and seen fingerprints to disk.
+        if _alert_watcher is not None:
+            _alert_watcher.stop()
+            _alert_watcher.join(timeout=3)
 
     readline.write_history_file(HISTORY)
     print("bye.")
