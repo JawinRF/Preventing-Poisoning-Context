@@ -296,7 +296,7 @@ class AlertWatcher(threading.Thread):
         self._rules:      list[AlertRule] = []
         self._rules_lock  = threading.Lock()
         self._seen        = _BoundedSet(_SEEN_MAXSIZE)
-        self._stop        = threading.Event()
+        self._stop_evt    = threading.Event()
 
         self._sidecar_retry_at: float = 0.0
         self._sidecar_warned:   bool  = False
@@ -311,7 +311,7 @@ class AlertWatcher(threading.Thread):
     # ── Thread lifecycle ──────────────────────────────────────────────────────
 
     def run(self) -> None:
-        while not self._stop.wait(_POLL_INTERVAL):
+        while not self._stop_evt.wait(_POLL_INTERVAL):
             try:
                 self._tick()
             except Exception as exc:
@@ -323,7 +323,7 @@ class AlertWatcher(threading.Thread):
         self._save_seen()
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
 
     # ── Main tick ─────────────────────────────────────────────────────────────
 

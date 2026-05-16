@@ -1266,7 +1266,7 @@ def _auto_corroborate(
         similar = shield.collection.query(
             query_texts=[summary], n_results=6,
             where={"source": "memory"},
-            include=["metadatas", "ids", "distances"],
+            include=["metadatas", "distances"],
         )
         cand_ids   = similar.get("ids",       [[]])[0]
         cand_metas = similar.get("metadatas", [[]])[0]
@@ -1294,6 +1294,40 @@ def _auto_corroborate(
         logger.warning(f"[Provenance] auto-corroborate failed: {exc}")
 
 
+# Direct phrases that, on their own, mean "store this fact" — plain substring.
+_SAVE_PHRASES = (
+    "save to memory", "save in memory", "save this to memory",
+    "save it to memory", "save to your memory", "save that to memory",
+    "remember that", "remember my", "remember this", "remember i ",
+    "remember we ", "remember to keep", "please remember",
+    "memorize", "memorise",
+    "note that", "note down",
+    "keep in mind that",
+    "don't forget that", "dont forget that",
+    "don't forget my", "dont forget my",
+    "add to memory", "add this to memory",
+)
+
+
+def _is_explicit_save_request(task: str) -> bool:
+    """True if the task is an explicit human instruction to store a fact.
+
+    Distinguishes 'remember that my name is X' (user-vouched, the human is in
+    the loop) from the agent auto-logging 'I opened Gmail and tapped compose'
+    (autonomous, no human in the loop). The former must be born trust=1.0
+    origin='user'; only the latter goes through the provisional machinery.
+
+    Plain lowercase substring matching — no regex.
+    """
+    t = (task or "").lower()
+    if any(phrase in t for phrase in _SAVE_PHRASES):
+        return True
+    # "store X in (your) memory" — verb + the word memory in the same task.
+    if "memory" in t and ("store " in t or "save " in t):
+        return True
+    return False
+
+
 def _record_experience(
     shield: "MemShield", task: str, history: "ActionHistory", summary: str,
     outcome: str = "success",
@@ -1302,7 +1336,9 @@ def _record_experience(
 
     Autonomous memories (origin='auto') receive a provenance-based birth trust
     prior computed from the T3 sources that were in context during the run.
-    Manual /memory save memories always use origin='user' with trust=1.0.
+    An explicit user save-request ('remember that ...') is user-vouched:
+    origin='user', trust=1.0, exempt from the provisional/Stage-1/Stage-2 path
+    — same as a manual /memory save.
     """
     import datetime
     steps_desc = []
@@ -1334,41 +1370,56 @@ def _record_experience(
     )
     doc_id = f"mem_{hashlib.sha256(doc.encode()).hexdigest()[:16]}"
 
-    # ── Provenance-based birth prior (autonomous path only) ───────────────
+    # ── Birth prior ───────────────────────────────────────────────────────
     lineage, session_id = get_active()
 
-    t3_sources  = lineage.get_session_t3_sources(session_id) if (lineage and session_id) else []
-    t3_fps      = [fp  for fp, _   in t3_sources]
-    t3_texts    = [txt for _,  txt in t3_sources]
-    par_trusts  = lineage.get_session_parent_trusts(session_id, shield.collection) \
-                  if (lineage and session_id and shield.collection) else []
+    user_vouched = _is_explicit_save_request(task)
 
-    # Context-based prior: worse if T3 was in context
-    context_prior = PRIOR_T3 if t3_fps else PRIOR_CLEAN
-
-    # Stage-1: causal overlap → audit-only prior + Stage-2 auto-tombstone trigger
-    stage1_flagged = compute_birth_prior(summary, task, t3_texts)
-    if stage1_flagged:
-        context_prior = PRIOR_FLAGGED
-
-    # T-norm: child trust capped by lineage parent trust (prevents laundering)
-    if par_trusts:
-        birth_trust = min(context_prior, EDGE_ATTEN * min(par_trusts))
+    if user_vouched:
+        # The human explicitly told the agent to store this. Same status as a
+        # manual /memory save: trust=1.0, origin='user', no provisional path.
+        birth_trust    = 1.0
+        origin         = "user"
+        stage1_flagged = False
+        t3_fps, t3_texts = [], []
+        logger.info(
+            "[Provenance] explicit user save-request — origin=user trust=1.0 "
+            "(exempt from provisional machinery)"
+        )
     else:
-        birth_trust = context_prior
+        t3_sources  = lineage.get_session_t3_sources(session_id) if (lineage and session_id) else []
+        t3_fps      = [fp  for fp, _   in t3_sources]
+        t3_texts    = [txt for _,  txt in t3_sources]
+        par_trusts  = lineage.get_session_parent_trusts(session_id, shield.collection) \
+                      if (lineage and session_id and shield.collection) else []
 
-    logger.info(
-        f"[Provenance] auto-memory birth trust={birth_trust:.2f} "
-        f"(t3={len(t3_fps)}, stage1_flagged={stage1_flagged}, "
-        f"parents={len(par_trusts)})"
-    )
+        # Context-based prior: worse if T3 was in context
+        context_prior = PRIOR_T3 if t3_fps else PRIOR_CLEAN
+
+        # Stage-1: causal overlap → audit-only prior + Stage-2 auto-tombstone trigger
+        stage1_flagged = compute_birth_prior(summary, task, t3_texts)
+        if stage1_flagged:
+            context_prior = PRIOR_FLAGGED
+
+        # T-norm: child trust capped by lineage parent trust (prevents laundering)
+        if par_trusts:
+            birth_trust = min(context_prior, EDGE_ATTEN * min(par_trusts))
+        else:
+            birth_trust = context_prior
+
+        origin = "auto"
+        logger.info(
+            f"[Provenance] auto-memory birth trust={birth_trust:.2f} "
+            f"(t3={len(t3_fps)}, stage1_flagged={stage1_flagged}, "
+            f"parents={len(par_trusts)})"
+        )
 
     try:
         stats = shield.ingest_with_scan(
             documents=[doc], ids=[doc_id],
             metadatas=[{
                 "source": "memory", "name": doc_id, "ts": ts,
-                "trust_score": birth_trust, "origin": "auto",
+                "trust_score": birth_trust, "origin": origin,
             }],
             source="memory", authority=0.9,
         )
@@ -1381,23 +1432,26 @@ def _record_experience(
                     f"[Lineage] auto-memory {doc_id[:12]} ← {n_parents} parent(s)"
                 )
 
-            if stage1_flagged:
-                # Stage-2: auto-tombstone + flag the T3 sources that authored the drift.
-                # Memory is kept for audit (tombstone) but driven below AUDIT_FLOOR.
-                if lineage and shield.collection:
-                    lineage.tombstone(doc_id, shield.collection)
-                causal_fps = get_causal_t3_fps(summary, task, t3_fps, t3_texts)
-                for fp in causal_fps:
+            # Stage-1/Stage-2/corroboration apply ONLY to the autonomous path.
+            # A user-vouched save is exempt (origin='user', trust=1.0).
+            if origin == "auto":
+                if stage1_flagged:
+                    # Stage-2: auto-tombstone + flag the T3 sources that authored
+                    # the drift. Memory kept for audit but driven below AUDIT_FLOOR.
                     if lineage and shield.collection:
-                        lineage.flag_t3_source(fp, T3_SUSPICION, shield.collection)
-                        logger.warning(
-                            f"[Provenance] Stage-2 flagged T3 source {fp} "
-                            f"(retroactive suspicion propagated)"
-                        )
-            else:
-                # Auto-corroborate: check if existing provisional memories were
-                # independently re-derived this session (no retrieval → graduation).
-                _auto_corroborate(shield, doc_id, summary, lineage, session_id)
+                        lineage.tombstone(doc_id, shield.collection)
+                    causal_fps = get_causal_t3_fps(summary, task, t3_fps, t3_texts)
+                    for fp in causal_fps:
+                        if lineage and shield.collection:
+                            lineage.flag_t3_source(fp, T3_SUSPICION, shield.collection)
+                            logger.warning(
+                                f"[Provenance] Stage-2 flagged T3 source {fp} "
+                                f"(retroactive suspicion propagated)"
+                            )
+                else:
+                    # Auto-corroborate: existing provisional memories that were
+                    # independently re-derived this session graduate upward.
+                    _auto_corroborate(shield, doc_id, summary, lineage, session_id)
     except Exception as e:
         logger.warning(f"Memory recording failed: {e}")
 

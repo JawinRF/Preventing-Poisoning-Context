@@ -836,7 +836,7 @@ def _launch_openclaw(serial: str) -> None:
         print(f"{YLW}  could not launch OpenClaw: {e}{R}")
 
 
-def repl(llm: str = "groq", serial: str = DEFAULT_SERIAL) -> None:
+def repl(llm: str = "claude", serial: str = DEFAULT_SERIAL) -> None:
     global _alert_watcher
 
     print(BANNER)
@@ -941,7 +941,7 @@ def repl(llm: str = "groq", serial: str = DEFAULT_SERIAL) -> None:
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description="PRISM Agent CLI")
-    p.add_argument("--llm", choices=["groq", "claude", "deepseek", "local"], default="groq")
+    p.add_argument("--llm", choices=["groq", "claude", "deepseek", "local"], default="claude")
     p.add_argument("--serial", default=DEFAULT_SERIAL)
     a = p.parse_args()
     repl(llm=a.llm, serial=a.serial)
