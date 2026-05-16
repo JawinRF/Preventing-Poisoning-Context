@@ -55,7 +55,18 @@ logger = logging.getLogger(__name__)
 _ANDROID_SIDECAR_URL = "http://127.0.0.1:8766"
 _CDP_PORT = 9222
 _CDP_MAX_CHARS = 2000  # keep web content concise for prompt
-_SIDECAR_TIMEOUT_S = 2
+
+# Minimum cosine similarity for a skill procedure to be considered relevant.
+# ChromaDB default space is L2 with normalized embeddings, so
+# cosine = 1 - (l2_distance / 2). Empirically: on-topic skill queries score
+# ~0.23-0.45, off-topic ones ~0.06-0.12. 0.20 separates them cleanly.
+_SKILL_MIN_COSINE = 0.20
+# On-device /v1/context assembly (notifications + clipboard + SMS + contacts
+# over accessibility/content providers) routinely exceeds 2s, especially the
+# cold first call. A too-short timeout makes the client disconnect mid-response;
+# the server then writes to a dead socket → "Broken pipe" + CLOSE_WAIT pileup.
+# This is only a ceiling — a healthy server returns in well under a second.
+_SIDECAR_TIMEOUT_S = 8
 
 
 def _annotate_marks(pil_img, elements: list[dict]):
@@ -1094,12 +1105,24 @@ class ContextAssembler:
                 query_texts=[query],
                 n_results=3,
                 where={"source": "skill"},
-                include=["documents", "metadatas"],
+                include=["documents", "metadatas", "distances"],
             )
             procedures = []
             docs  = results.get("documents", [[]])[0]
             metas = results.get("metadatas", [[]])[0]
-            for doc, meta in zip(docs, metas or []):
+            dists = results.get("distances", [[]])[0]
+            for doc, meta, dist in zip(docs, metas or [], dists or []):
+                # Relevance gate: ChromaDB L2 + normalized embeddings →
+                # cosine = 1 - dist/2. Skills below the floor are unrelated
+                # noise (top-N always returns the nearest skill even when
+                # nothing actually matches) — drop them.
+                cosine = 1.0 - (dist / 2.0)
+                if cosine < _SKILL_MIN_COSINE:
+                    logger.info(
+                        f"[Skill] dropped (cosine={cosine:.3f} < "
+                        f"{_SKILL_MIN_COSINE}): {doc[:60]}"
+                    )
+                    continue
                 # New format: description is the doc, procedure is in metadata body
                 # Old format: full text stored as doc, no separate body
                 body = meta.get("body") if meta else None

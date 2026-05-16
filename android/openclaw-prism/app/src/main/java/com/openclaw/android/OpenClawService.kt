@@ -109,7 +109,16 @@ class OpenClawService : Service() {
                     "/v1/inspect" -> kotlinx.coroutines.runBlocking { svc.handleInspect(body) }
                     "/v1/guard" -> svc.handleGuard(body)
                     "/v1/ui-integrity" -> svc.handleUiIntegrity(body)
-                    "/v1/context" -> svc.handleContext()
+                    "/v1/context" -> kotlinx.coroutines.runBlocking {
+                        // Hard ceiling: a slow device read can never hang the
+                        // agent's per-step context fetch again. On timeout the
+                        // agent proceeds in degraded mode rather than freezing.
+                        kotlinx.coroutines.withTimeoutOrNull(6000L) {
+                            svc.handleContext()
+                        } ?: """{"error":"context_timeout","notifications":[],""" +
+                             """"clipboard":"","sms":[],"contacts":[],"calendar":[],""" +
+                             """"prism_context_blocked":0}"""
+                    }
                     "/v1/audit" -> kotlinx.coroutines.runBlocking {
                         svc.handleAudit(session.parameters["limit"]?.firstOrNull())
                     }
@@ -295,9 +304,15 @@ class OpenClawService : Service() {
             if (text.isBlank()) return text
             val norm = Normalizer.normalize(text)
             val l1 = PrismDetector.scan(norm.text)
-            val l2Prob = classifier?.classify(norm.text)?.maliciousProb ?: 0.0f
+            // L2 ONNX scan intentionally NOT run here. It previously ran one
+            // synchronous inference per field (notifications + clipboard + up
+            // to 20 SMS + 20 contacts + 20 calendar = ~60 serial inferences)
+            // on the single NanoHTTPD worker thread, which hung /v1/context on
+            // a cold device. The Python agent re-scans every field through
+            // MemShield / PRISM :8765 before the LLM sees it, so the on-device
+            // L2 in the context path is redundant. Fast L1 regex stays.
             val l1Block = l1.verdict == PrismDetector.Verdict.BLOCK
-            val blocked = l2Prob >= 0.70f || (l1Block && l2Prob >= 0.30f) || l1.score >= 0.80f
+            val blocked = l1Block || l1.score >= 0.80f
             if (blocked) {
                 contextBlockedCount++
                 serviceScope.launch {
@@ -307,7 +322,7 @@ class OpenClawService : Service() {
                             snippet = norm.text.take(120),
                             verdict = "BLOCK",
                             layer1Score = l1.score,
-                            layer2Prob = l2Prob,
+                            layer2Prob = 0.0f,
                             matchedRules = l1.matchedRules.joinToString(",")
                         )
                     )
@@ -349,7 +364,7 @@ class OpenClawService : Service() {
 
         try {
             val smsArray = org.json.JSONArray()
-            reader.getSmsMessages(limit = 20).forEach { m ->
+            reader.getSmsMessages(limit = 8).forEach { m ->
                 smsArray.put(JSONObject().apply {
                     put("id", m.id)
                     put("address", m.address)
@@ -365,7 +380,7 @@ class OpenClawService : Service() {
 
         try {
             val contactsArray = org.json.JSONArray()
-            reader.getContacts(limit = 20).forEach { c ->
+            reader.getContacts(limit = 8).forEach { c ->
                 contactsArray.put(JSONObject().apply {
                     put("id", c.id)
                     put("name", c.name)
@@ -380,7 +395,7 @@ class OpenClawService : Service() {
 
         try {
             val calendarArray = org.json.JSONArray()
-            reader.getCalendarEvents(limit = 20).forEach { ev ->
+            reader.getCalendarEvents(limit = 8).forEach { ev ->
                 calendarArray.put(JSONObject().apply {
                     put("id", ev.id)
                     put("title", scanField(ev.title, "calendar_context"))
