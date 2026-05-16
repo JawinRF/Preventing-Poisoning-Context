@@ -24,6 +24,24 @@ from dataclasses import dataclass, field
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+try:
+    from memory_lineage import (
+        get_active, t3_fp,
+        L1_SUSPICION, L2_SUSPICION, T3_SUSPICION, TRUST_THRESHOLD,
+        AUDIT_FLOOR, RETRIEVAL_BETA,
+    )
+    _LINEAGE_AVAILABLE = True
+except ImportError:
+    _LINEAGE_AVAILABLE = False
+    def get_active():              return None, ""
+    def t3_fp(src, **kw):         return ""
+    L1_SUSPICION    = 1.0
+    L2_SUSPICION    = 0.5
+    T3_SUSPICION    = 0.7
+    TRUST_THRESHOLD = 0.3
+    AUDIT_FLOOR     = 0.10
+    RETRIEVAL_BETA  = 1.0
+
 from prism_client import InspectResult, PrismClient
 
 # Sentinel reused for notifications with empty text — avoids constructing a
@@ -502,18 +520,33 @@ class ContextAssembler:
                         )
 
         # Step 3 — build output entirely from seen cache  O(N), zero network
+        lineage, session_id = get_active()
         allowed: list[dict] = []
         blocked: int = 0
         for n, fp in zip(raw, fps):
             result = self._notif_seen[fp]
+            pkg    = n.get("package", "unknown")
+            title  = n.get("title",   "")
+            text   = n.get("text",    "")
+            lfp    = t3_fp("notification", pkg=pkg, title=title, text=text)
             if result.allowed:
-                allowed.append({
-                    "package": n.get("package", "unknown"),
-                    "title":   n.get("title",   ""),
-                    "text":    n.get("text",    ""),
-                })
+                allowed.append({"package": pkg, "title": title, "text": text})
+                if lineage and session_id and lfp:
+                    lineage.record_t3_source(
+                        session_id, lfp, "notification",
+                        f"{pkg}: {title[:40]}", pkg,
+                    )
             else:
                 blocked += 1
+                # Auto-flag: if this fingerprint was allowed in a past session
+                # but PRISM now blocks it, retroactively propagate suspicion.
+                if lineage and lfp and lineage.was_t3_seen_before(lfp, session_id):
+                    col = self.memshield.collection if self.memshield else None
+                    logger.warning(
+                        f"[Lineage] Notification {lfp} was previously allowed, "
+                        f"now blocked — auto-flagging"
+                    )
+                    lineage.flag_t3_source(lfp, T3_SUSPICION, col)
 
         return allowed, blocked
 
@@ -535,10 +568,22 @@ class ContextAssembler:
             source_name="system_clipboard",
         )
 
+        lineage, session_id = get_active()
+        lfp = t3_fp("clipboard", content=clip_text) if clip_text else ""
+
         if r.allowed:
+            if lineage and session_id and lfp:
+                lineage.record_t3_source(
+                    session_id, lfp, "clipboard",
+                    f"clipboard: {clip_text[:40]}",
+                )
             return clip_text, 0
 
         logger.warning(f"Clipboard BLOCKED: '{clip_text[:60]}' — {r.reason}")
+        if lineage and lfp and lineage.was_t3_seen_before(lfp, session_id):
+            col = self.memshield.collection if self.memshield else None
+            logger.warning(f"[Lineage] Clipboard {lfp} was previously allowed, now blocked — auto-flagging")
+            lineage.flag_t3_source(lfp, T3_SUSPICION, col)
         return None, 1
 
     def _filter_sms(self, device_ctx: dict) -> tuple[list[dict], int]:
@@ -562,15 +607,23 @@ class ContextAssembler:
                 source_name=msg.get("address", "unknown"),
             )
 
+            lineage, session_id = get_active()
+            sender = msg.get("address", "unknown")
+            lfp    = t3_fp("sms", sender=sender, body=text)
             if r.allowed:
-                allowed.append({
-                    "id": msg.get("id"),
-                    "address": msg.get("address"),
-                    "body": text,
-                })
+                allowed.append({"id": msg.get("id"), "address": sender, "body": text})
+                if lineage and session_id and lfp:
+                    lineage.record_t3_source(
+                        session_id, lfp, "sms",
+                        f"sms:{sender}: {text[:40]}",
+                    )
             else:
                 blocked += 1
-                logger.warning(f"SMS BLOCKED: [{msg.get('address')}] '{text[:60]}'")
+                logger.warning(f"SMS BLOCKED: [{sender}] '{text[:60]}'")
+                if lineage and lfp and lineage.was_t3_seen_before(lfp, session_id):
+                    col = self.memshield.collection if self.memshield else None
+                    logger.warning(f"[Lineage] SMS {lfp} was previously allowed, now blocked — auto-flagging")
+                    lineage.flag_t3_source(lfp, T3_SUSPICION, col)
 
         return allowed, blocked
 
@@ -909,39 +962,105 @@ class ContextAssembler:
             raw = self.memshield.collection.query(
                 query_texts=[query], n_results=3,
                 where={"source": "memory"},
-                include=["documents", "metadatas"],
+                include=["documents", "metadatas", "distances"],
             )
-            raw_docs  = raw.get("documents", [[]])[0]
-            raw_metas = raw.get("metadatas",  [[]])[0]
-            raw_ids   = raw.get("ids",        [[]])[0]
+            raw_docs      = raw.get("documents", [[]])[0]
+            raw_metas     = raw.get("metadatas",  [[]])[0]
+            raw_ids       = raw.get("ids",        [[]])[0]
+            raw_distances = raw.get("distances",  [[]])[0]
+
+            # ChromaDB returns cosine distance [0,1]. Convert to similarity.
+            raw_sims = [max(0.0, 1.0 - d) for d in raw_distances] if raw_distances \
+                       else [1.0] * len(raw_docs)
 
             logger.info(f"[Memory] Retrieved {len(raw_docs)} candidate(s) for query: {query[:60]}")
 
+            lineage, session_id = get_active()
+
             # ── Layer 1: provenance seal check (fast, deterministic) ─────────
             # Docs without content_hash+provenance_ts were injected directly
-            # into ChromaDB, bypassing MemShield ingest. Purge immediately.
-            sealed_docs, sealed_metas, sealed_ids = [], [], []
-            for doc_id, doc, meta in zip(raw_ids, raw_docs, raw_metas or []):
+            # into ChromaDB, bypassing MemShield ingest. Tombstone immediately
+            # (non-destructive: row kept for audit, trust → AUDIT_FLOOR).
+            # Lineage: propagate full suspicion from any directly injected doc.
+            sealed_docs, sealed_metas, sealed_ids, sealed_sims = [], [], [], []
+            for doc_id, doc, meta, sim in zip(raw_ids, raw_docs, raw_metas or [], raw_sims):
                 if meta and meta.get("content_hash") and meta.get("provenance_ts"):
                     logger.info(f"[Memory] L1 PASS (sealed): {doc[:80]}")
                     sealed_docs.append(doc)
                     sealed_metas.append(meta)
                     sealed_ids.append(doc_id)
+                    sealed_sims.append(sim)
                 else:
                     logger.warning(
                         f"[Memory] L1 PURGE — no provenance seal "
                         f"(direct DB injection): {doc[:80]}"
                     )
-                    self.memshield.collection.delete(ids=[doc_id])
+                    # Tombstone (non-destructive) instead of hard delete
+                    if lineage:
+                        lineage.tombstone(doc_id, self.memshield.collection)
+                        lineage.propagate_suspicion(
+                            doc_id, L1_SUSPICION, self.memshield.collection
+                        )
+                    else:
+                        self.memshield.collection.delete(ids=[doc_id])
 
             logger.info(f"[Memory] L1 result: {len(sealed_docs)}/{len(raw_docs)} sealed")
 
             if not sealed_docs:
                 return []
 
+            # ── Layer 1.5: provenance-weighted soft rerank ───────────────────
+            # Replaces binary TRUST_THRESHOLD filter with:
+            #   effective_score = cosine_sim × trust^RETRIEVAL_BETA
+            # This starves compounding wrong memories (low trust → low effective
+            # score) without ever needing to identify them explicitly.
+            # Tombstoned docs (trust < AUDIT_FLOOR) are the only hard exclusion.
+            # origin="user" memories carry trust=1.0 → rerank is a no-op for them.
+            if lineage:
+                scored: list[tuple[float, str, str, dict]] = []
+                for doc_id, doc, meta, sim in zip(
+                    sealed_ids, sealed_docs, sealed_metas, sealed_sims
+                ):
+                    trust = float(meta.get("trust_score", 1.0))
+                    if trust < AUDIT_FLOOR:
+                        logger.warning(
+                            f"[Lineage] {doc_id[:12]} trust={trust:.3f} < "
+                            f"AUDIT_FLOOR={AUDIT_FLOOR} — tombstoned, skipping"
+                        )
+                        continue
+                    effective = sim * (trust ** RETRIEVAL_BETA)
+                    scored.append((effective, doc_id, doc, meta))
+                    if meta.get("origin", "user") == "auto":
+                        logger.info(
+                            f"[Lineage] {doc_id[:12]} effective={effective:.3f} "
+                            f"(sim={sim:.3f}, trust={trust:.3f})"
+                        )
+
+                # Sort by effective score descending (highest sim×trust first)
+                scored.sort(key=lambda x: x[0], reverse=True)
+                sealed_ids   = [x[1] for x in scored]
+                sealed_docs  = [x[2] for x in scored]
+                sealed_metas = [x[3] for x in scored]
+
+                if len(sealed_ids) < len(sealed_sims):
+                    logger.info(
+                        f"[Lineage] L1.5 soft rerank: "
+                        f"{len(sealed_ids)}/{len(sealed_sims)} passed "
+                        f"(tombstoned excluded)"
+                    )
+
+            if not sealed_docs:
+                return []
+
+            # Record which sealed docs were retrieved this session — so any
+            # memory the user saves later inherits these as parents.
+            if lineage and session_id and sealed_ids:
+                lineage.record_retrieval(session_id, sealed_ids)
+
             # ── Layer 2: MemShield retrieval defense (influence + ragmask + authority + scorer)
             # Routes sealed docs through the full cross-doc scoring pipeline.
             # MemShield logs BLOCKED/QUARANTINED chunks with poison scores.
+            # Lineage: propagate partial suspicion from any doc blocked here.
             logger.info(f"[Memory] L2 MemShield running on {len(sealed_docs)} sealed doc(s)…")
             defended = self.memshield.query(
                 query_texts=[query],
@@ -951,6 +1070,17 @@ class ContextAssembler:
             )
             defended_docs = defended.get("documents", [[]])[0]
             logger.info(f"[Memory] L2 result: {len(defended_docs)}/{len(sealed_docs)} passed MemShield")
+
+            # Propagate partial suspicion for docs blocked at L2
+            if lineage and len(defended_docs) < len(sealed_docs):
+                defended_set = set(defended_docs)
+                for doc_id, doc in zip(sealed_ids, sealed_docs):
+                    if doc not in defended_set:
+                        logger.warning(f"[Lineage] L2 blocked {doc_id[:12]} — propagating suspicion")
+                        lineage.propagate_suspicion(
+                            doc_id, L2_SUSPICION, self.memshield.collection
+                        )
+
             return defended_docs
         except Exception:
             return sealed_docs if 'sealed_docs' in dir() else []

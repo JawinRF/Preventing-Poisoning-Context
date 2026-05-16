@@ -38,6 +38,24 @@ try:
 except ImportError:
     _RAG_AVAILABLE = False
 
+# Memory lineage + provenance imports (optional — same graceful degradation)
+try:
+    from memory_lineage import (
+        get_active,
+        PRIOR_CLEAN, PRIOR_T3, PRIOR_FLAGGED, AUDIT_FLOOR, EDGE_ATTEN,
+    )
+    from memory_provenance import compute_birth_prior
+    _LINEAGE_AVAILABLE = True
+except ImportError:
+    _LINEAGE_AVAILABLE = False
+    def get_active():       return None, ""
+    PRIOR_CLEAN   = 0.60
+    PRIOR_T3      = 0.35
+    PRIOR_FLAGGED = 0.15
+    AUDIT_FLOOR   = 0.10
+    EDGE_ATTEN    = 0.90
+    def compute_birth_prior(*a, **kw): return False
+
 
 # ── MemShield embedder/generator helpers ─────────────────────────────────────
 # These bridge ChromaDB's default embedding function into MemShield's
@@ -1227,8 +1245,9 @@ def _record_experience(
 ):
     """Record every completed task as a memory in the RAG store.
 
-    Stored with source='memory' so context_assembler can surface them
-    distinctly from skills/KB docs in the agent prompt.
+    Autonomous memories (origin='auto') receive a provenance-based birth trust
+    prior computed from the T3 sources that were in context during the run.
+    Manual /memory save memories always use origin='user' with trust=1.0.
     """
     import datetime
     steps_desc = []
@@ -1260,14 +1279,51 @@ def _record_experience(
     )
     doc_id = f"mem_{hashlib.sha256(doc.encode()).hexdigest()[:16]}"
 
+    # ── Provenance-based birth prior (autonomous path only) ───────────────
+    lineage, session_id = get_active()
+
+    t3_count    = lineage.get_session_t3_count(session_id)    if (lineage and session_id) else 0
+    t3_texts    = lineage.get_session_t3_texts(session_id)    if (lineage and session_id) else []
+    par_trusts  = lineage.get_session_parent_trusts(session_id, shield.collection) \
+                  if (lineage and session_id and shield.collection) else []
+
+    # Context-based prior: worse if T3 was in context
+    context_prior = PRIOR_T3 if t3_count > 0 else PRIOR_CLEAN
+
+    # Stage-1: causal overlap → audit-only prior
+    stage1_flagged = compute_birth_prior(summary, task, t3_texts)
+    if stage1_flagged:
+        context_prior = PRIOR_FLAGGED
+
+    # T-norm: child trust capped by lineage parent trust (prevents laundering)
+    if par_trusts:
+        birth_trust = min(context_prior, EDGE_ATTEN * min(par_trusts))
+    else:
+        birth_trust = context_prior
+
+    logger.info(
+        f"[Provenance] auto-memory birth trust={birth_trust:.2f} "
+        f"(t3={t3_count}, stage1_flagged={stage1_flagged}, "
+        f"parents={len(par_trusts)})"
+    )
+
     try:
         stats = shield.ingest_with_scan(
             documents=[doc], ids=[doc_id],
-            metadatas=[{"source": "memory", "name": doc_id, "ts": ts}],
+            metadatas=[{
+                "source": "memory", "name": doc_id, "ts": ts,
+                "trust_score": birth_trust, "origin": "auto",
+            }],
             source="memory", authority=0.9,
         )
         if stats["accepted"] > 0:
-            logger.info(f"Memory stored: {doc[:80]}")
+            logger.info(f"Memory stored: {doc[:80]} (trust={birth_trust:.2f})")
+            # Wire lineage edges: all T3 + ChromaDB sources in session → new memory
+            if lineage and session_id:
+                n_parents = lineage.record_save(session_id, doc_id)
+                logger.info(
+                    f"[Lineage] auto-memory {doc_id[:12]} ← {n_parents} parent(s)"
+                )
     except Exception as e:
         logger.warning(f"Memory recording failed: {e}")
 
