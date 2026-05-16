@@ -1117,12 +1117,20 @@ class ContextAssembler:
                 # noise (top-N always returns the nearest skill even when
                 # nothing actually matches) — drop them.
                 cosine = 1.0 - (dist / 2.0)
+                name = (meta.get("name") if meta else None) or doc[:50]
                 if cosine < _SKILL_MIN_COSINE:
                     logger.info(
-                        f"[Skill] dropped (cosine={cosine:.3f} < "
-                        f"{_SKILL_MIN_COSINE}): {doc[:60]}"
+                        f"[Skill] DROP  cosine={cosine:.3f} < "
+                        f"{_SKILL_MIN_COSINE}  — {name}"
                     )
                     continue
+                # Cosine is logged for the operator only — it is NEVER added to
+                # `procedures`, so it never reaches the agent prompt. The agent
+                # sees the procedure body alone, no relevance score.
+                logger.info(
+                    f"[Skill] KEEP  cosine={cosine:.3f} >= "
+                    f"{_SKILL_MIN_COSINE}  — {name}"
+                )
                 # New format: description is the doc, procedure is in metadata body
                 # Old format: full text stored as doc, no separate body
                 body = meta.get("body") if meta else None
