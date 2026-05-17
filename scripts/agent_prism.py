@@ -720,7 +720,9 @@ def _raw_llm_call(llm_name: str, screenshot_b64: str | None = None) -> dict:
                 ]}
             msg = client.messages.create(
                 model=CLAUDE_MODEL, max_tokens=300,
-                system=_active_system_prompt, messages=messages,
+                system=[{"type": "text", "text": _active_system_prompt,
+                         "cache_control": {"type": "ephemeral"}}],
+                messages=messages,
             )
             raw = msg.content[0].text.strip()
 
@@ -918,7 +920,10 @@ def ask_claude(prompt_dict: dict) -> dict:
     _conversation.append({"role": "user", "content": json.dumps(prompt_dict)})
     _trim_conversation()
 
-    # Build messages: older turns are text-only, current turn is multimodal
+    # Build messages: older turns are text-only, current turn is multimodal.
+    # Cache the second-to-last user turn (stable history) so the conversation
+    # prefix is reused across steps. Current turn is never cached — it changes
+    # every step and would never hit the cache anyway.
     messages = []
     for m in _conversation:
         if m["role"] == "system":
@@ -927,6 +932,16 @@ def ask_claude(prompt_dict: dict) -> dict:
     # Replace the last user message with the multimodal version
     if messages and messages[-1]["role"] == "user":
         messages[-1] = {"role": "user", "content": content_parts}
+    # Mark the second-to-last user turn as cacheable (stable conversation prefix)
+    if len(messages) >= 3:
+        prev_user = messages[-3]
+        if prev_user["role"] == "user":
+            prev_content = prev_user["content"]
+            if isinstance(prev_content, str):
+                prev_user["content"] = [
+                    {"type": "text", "text": prev_content,
+                     "cache_control": {"type": "ephemeral"}}
+                ]
 
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     client = anthropic.Anthropic(api_key=key)
@@ -935,7 +950,9 @@ def ask_claude(prompt_dict: dict) -> dict:
         msg = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=300,
-            system=_active_system_prompt,
+            # Cache the system prompt — identical every step, qualifies at ~1500+ tokens.
+            system=[{"type": "text", "text": _active_system_prompt,
+                     "cache_control": {"type": "ephemeral"}}],
             messages=messages,
         )
         raw = msg.content[0].text.strip()
@@ -1193,7 +1210,10 @@ def _setup_rag(enable_prism: bool, installed_apps: list[dict] | None = None) -> 
     try:
         db_path = os.path.join(os.path.dirname(__file__), "..", "data", "chromadb")
         client = chromadb.PersistentClient(path=db_path)
-        collection = client.get_or_create_collection("agent_kb")
+        from embedding_fn import get_embedding_fn
+        collection = client.get_or_create_collection(
+            "agent_kb", embedding_function=get_embedding_fn()
+        )
 
         retrieval_defense = (
             enable_prism

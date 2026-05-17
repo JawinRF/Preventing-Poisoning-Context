@@ -77,6 +77,7 @@ HELP = f"""
 
 {B}Memory  (auto-saved after every task):{R}
   {CYN}/memory list{R}               Show recent task memories
+  {CYN}/memory view <id>{R}          Show full content of a memory
   {CYN}/memory clear{R}              Wipe all memories
 
 {B}Daemon:{R}
@@ -100,8 +101,11 @@ def _rag_collection():
     """Return the ChromaDB collection, or None if unavailable."""
     try:
         import chromadb
+        from embedding_fn import get_embedding_fn
         client = chromadb.PersistentClient(path=_DB_PATH)
-        return client.get_or_create_collection(_COLLECTION)
+        return client.get_or_create_collection(
+            _COLLECTION, embedding_function=get_embedding_fn()
+        )
     except Exception as e:
         print(f"{RED}  chromadb unavailable: {e}{R}")
         return None
@@ -137,8 +141,10 @@ def _queue(args: list[str], llm: str, serial: str) -> None:
     sub = args[0] if args else "list"
 
     if sub == "list":
-        rows = q.list_tasks(limit=20)
-        print(f"{DIM}  queue empty{R}") if not rows else None
+        show_all = len(args) > 1 and args[1] == "all"
+        rows = q.list_tasks(status=None if show_all else "pending", limit=20)
+        if not rows:
+            print(f"{DIM}  {'no tasks' if show_all else 'queue empty'}{R}")
         for r in rows:
             print(f"  {DIM}{r['id'][:8]}{R}  {_sc(r['status'])}{r['status']:<9}{R}  {r['task_text'][:60]}")
 
@@ -151,9 +157,22 @@ def _queue(args: list[str], llm: str, serial: str) -> None:
         q.mark_done(row["id"], ok=ok, note="done" if ok else "failed")
         print(f"{GRN}✓ done{R}" if ok else f"{RED}✗ failed{R}")
 
+    elif sub in ("del", "delete", "rm"):
+        if len(args) < 2:
+            print(f"{RED}  /queue del <id_prefix>{R}"); return
+        prefix = args[1]
+        with q._conn() as c:
+            rows = c.execute("SELECT id, task_text FROM tasks WHERE id LIKE ?",
+                             (prefix + "%",)).fetchall()
+            if not rows:
+                print(f"{RED}  no task with id starting '{prefix}'{R}"); return
+            for row in rows:
+                c.execute("DELETE FROM tasks WHERE id = ?", (row[0],))
+                print(f"{YLW}  deleted [{row[0][:8]}]{R}  {row[1][:60]}")
+
     elif sub == "clear":
         with q._conn() as c:
-            c.execute("UPDATE tasks SET status='cancelled' WHERE status='pending'")
+            c.execute("DELETE FROM tasks")
         print(f"{YLW}  queue cleared{R}")
 
     else:
@@ -241,10 +260,14 @@ def _skill(args: list[str]) -> None:
             print(f"{RED}  /skill add <name> <instructions>{R}"); return
         name, *rest = args[1:]
         body = " ".join(rest)
-        # Auto-derive trigger: skill name (spaces → words) + first sentence
+        # Embed the FULL instruction body, not just the first sentence. The
+        # old name+first-sentence surface was brittle (broke on "e.g."/decimals/
+        # package paths) and embedded toward implementation tokens instead of
+        # the task. The whole body is the retrieval surface; the agent still
+        # receives meta["body"] only. Name words lead so the skill's intent
+        # is weighted up front.
         name_words = name.replace("-", " ").replace("_", " ")
-        first_sentence = body.split(".")[0].strip()
-        description = f"{name_words}: {first_sentence}"
+        description = f"{name_words}. {body}".strip()
         sid = f"{_SKILL_PREFIX}{name}"
         shield = _rag_shield(col)
         if shield:
@@ -404,6 +427,26 @@ def _memory(args: list[str]) -> None:
             if n_parents:
                 print(f"  {DIM}lineage: {n_parents} parent(s) linked{R}")
 
+    elif sub == "view":
+        if len(args) < 2:
+            print(f"{RED}  /memory view <id_prefix>{R}"); return
+        prefix = args[1]
+        all_r = col.get(where={"source": "memory"}, include=["documents", "metadatas"])
+        ids   = all_r.get("ids", [])
+        docs  = all_r.get("documents", [])
+        metas = all_r.get("metadatas", []) or []
+        match = [(i, d, m) for i, d, m in zip(ids, docs, metas) if i.startswith(prefix)]
+        if not match:
+            print(f"{RED}  no memory with id starting '{prefix}'{R}"); return
+        mid, doc, meta = match[0]
+        trust  = float((meta or {}).get("trust_score", 1.0))
+        origin = (meta or {}).get("origin", "auto")
+        sealed = bool((meta or {}).get("content_hash"))
+        bar    = f"{GRN}" if trust >= 0.7 else (f"{YLW}" if trust >= 0.3 else f"{RED}")
+        print(f"\n  {B}{mid}{R}")
+        print(f"  trust={bar}{trust:.3f}{R}  origin={origin}  sealed={'yes' if sealed else 'NO'}")
+        print(f"\n  {doc}\n")
+
     elif sub in ("del", "delete"):
         if len(args) < 2:
             print(f"{RED}  /memory del <index>  (use /memory list to see indices){R}"); return
@@ -430,6 +473,51 @@ def _memory(args: list[str]) -> None:
         # /memory lineage [doc_id|flag-source <fp>]
         if not _lineage:
             print(f"{RED}  lineage graph not available{R}"); return
+
+        # /memory lineage edges
+        if len(args) >= 2 and args[1] == "edges":
+            rows = _lineage._conn.execute(
+                "SELECT parent_id, child_id, weight, created_at FROM edges ORDER BY created_at"
+            ).fetchall()
+            if not rows:
+                print(f"  {DIM}no edges{R}"); return
+
+            # Fetch all existing memory docs from ChromaDB for text lookup
+            all_r   = col.get(where={"source": "memory"}, include=["documents"])
+            id_to_text = {mid: doc for mid, doc in zip(
+                all_r.get("ids", []), all_r.get("documents", [])
+            )}
+
+            def _node_label(nid: str) -> str | None:
+                if nid.startswith("t3:"):
+                    return f"[T3] {nid}"
+                doc = id_to_text.get(nid)
+                if doc is None:
+                    return None  # deleted — skip
+                # strip [MEMORY yyyy-mm-dd hh:mm] prefix, show first 50 chars
+                text = doc
+                if text.startswith("[MEMORY ") and "] " in text:
+                    text = text.split("] ", 1)[1]
+                return f"{nid[:12]}  {text[:50]}"
+
+            printed = 0
+            print()
+            for parent, child, weight, ts in rows:
+                plabel = _node_label(parent)
+                clabel = _node_label(child)
+                if plabel is None or clabel is None:
+                    continue  # either end deleted — skip edge
+                bar = f"{GRN}" if weight >= 0.7 else (f"{YLW}" if weight >= 0.3 else f"{RED}")
+                print(f"  {DIM}{plabel}{R}")
+                print(f"  {'':4}→ {bar}{weight:.3f}{R}  {clabel}")
+                print()
+                printed += 1
+
+            if printed == 0:
+                print(f"  {DIM}no edges with existing memories{R}")
+            else:
+                print(f"  {printed} edge(s)\n")
+            return
 
         # /memory lineage flag-source <fingerprint>
         if len(args) >= 2 and args[1] == "flag-source":
@@ -481,7 +569,7 @@ def _memory(args: list[str]) -> None:
         print()
 
     else:
-        print(f"{RED}  /memory list | save <text> | del <index> | clear | lineage [id]{R}")
+        print(f"{RED}  /memory list | view <id> | save <text> | del <index> | clear | lineage [id]{R}")
 
 
 # ── Chat with Claude ────────────────────────────────────────────────────────

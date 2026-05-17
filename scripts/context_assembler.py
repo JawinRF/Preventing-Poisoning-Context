@@ -57,10 +57,16 @@ _CDP_PORT = 9222
 _CDP_MAX_CHARS = 2000  # keep web content concise for prompt
 
 # Minimum cosine similarity for a skill procedure to be considered relevant.
-# ChromaDB default space is L2 with normalized embeddings, so
-# cosine = 1 - (l2_distance / 2). Empirically: on-topic skill queries score
-# ~0.23-0.45, off-topic ones ~0.06-0.12. 0.20 separates them cleanly.
-_SKILL_MIN_COSINE = 0.20
+# ChromaDB L2 + normalized embeddings, so cosine = 1 - (l2_distance / 2).
+#
+# IMPORTANT: this floor is embedder-specific and MUST be re-baselined if the
+# embedding model changes (see scripts/embedding_fn.py / reembed_store.py).
+#   - old all-MiniLM-L6-v2:   on-topic ~0.23-0.45, off-topic ~0.06-0.12
+#   - bge-small-en-v1.5 (now): scores compress into a tight high band.
+#     Measured: a correct skill match lands >=0.80 with a clear top hit;
+#     a no-skill-applies query (e.g. "remember my name") tops out ~0.77 in
+#     a flat cluster. 0.78 cleanly drops the latter and keeps real matches.
+_SKILL_MIN_COSINE = 0.78
 # On-device /v1/context assembly (notifications + clipboard + SMS + contacts
 # over accessibility/content providers) routinely exceeds 2s, especially the
 # cold first call. A too-short timeout makes the client disconnect mid-response;
@@ -311,6 +317,9 @@ class ContextAssembler:
         # Only truly new or changed notifications reach the sidecar each step;
         # previously seen notifications are served from this dict in O(1).
         self._notif_seen: dict[int, InspectResult] = {}
+        # Texts of blocked notifications (lowercased) — used to scrub screen
+        # context so the agent cannot see blocked content via the UI path.
+        self._blocked_notif_texts: set[str] = set()
         # Sidecar reachability cache — persisted to /tmp so the 30s backoff
         # survives across ContextAssembler instances (one per agent run).
         self._sidecar_state_file = "/tmp/prism_sidecar_retry_at"
@@ -418,6 +427,27 @@ class ContextAssembler:
             for path in ("notifications", "clipboard", "sms", "contacts"):
                 ctx.blocked_counts[path] = 0
                 ctx.degraded_paths.append(path)
+
+        # Scrub screen elements that contain blocked notification text.
+        # _gather_ui ran before _filter_notifications, so the agent would
+        # otherwise see blocked content via the UI path (notification shade).
+        if self._blocked_notif_texts:
+            scrubbed = 0
+            for elem in ctx.ui_elements:
+                elem_text = (elem.get("text") or "").strip().lower()
+                if elem_text and any(
+                    b and (b in elem_text or elem_text in b)
+                    for b in self._blocked_notif_texts
+                ):
+                    elem["text"] = "[PRISM_BLOCKED]"
+                    scrubbed += 1
+            if scrubbed:
+                ctx.warned_counts["ui_accessibility"] = (
+                    ctx.warned_counts.get("ui_accessibility", 0) + scrubbed
+                )
+                logger.warning(
+                    f"[ScreenScrub] Redacted {scrubbed} UI element(s) matching blocked notification text"
+                )
 
         # 3. Shared Storage (ADB file reads — explicit paths only)
         ctx.storage_data, stor_blocked = self._gather_storage()
@@ -549,6 +579,9 @@ class ContextAssembler:
                     )
             else:
                 blocked += 1
+                # Track blocked texts so _gather_ui can scrub screen context.
+                self._blocked_notif_texts.add(title.strip().lower())
+                self._blocked_notif_texts.add(text.strip().lower())
                 # Auto-flag: if this fingerprint was allowed in a past session
                 # but PRISM now blocks it, retroactively propagate suspicion.
                 if lineage and lfp and lineage.was_t3_seen_before(lfp, session_id):

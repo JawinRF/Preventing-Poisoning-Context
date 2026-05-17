@@ -3,17 +3,42 @@ set -e
 
 # ── config ────────────────────────────────────────────────────────────────────
 ANDROID_HOME="${ANDROID_HOME:-/home/jrf/Android}"
-BUILD_TOOLS="$ANDROID_HOME/build-tools/30.0.3"
-# Try both common SDK locations for android.jar
+
+# Prefer the requested SDK root, then fall back to the alternate SDK layout used
+# on this workstation.
+SDK_ROOTS=(
+    "$ANDROID_HOME"
+    "/home/jrf/Android"
+    "/home/jrf/Android/Sdk"
+    "/usr/lib/android-sdk"
+)
+
+BUILD_TOOLS=""
+for root in "${SDK_ROOTS[@]}"; do
+    [ -d "$root/build-tools" ] || continue
+    latest="$(find "$root/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+    if [ -n "$latest" ] && [ -x "$latest/aapt" ] && [ -x "$latest/d8" ] && [ -x "$latest/apksigner" ]; then
+        BUILD_TOOLS="$latest"
+        break
+    fi
+done
+
+if [ -z "$BUILD_TOOLS" ]; then
+    echo "ERROR: Android build-tools not found. Install build tools with:"
+    echo "  sdkmanager 'build-tools;35.0.0'"
+    exit 1
+fi
+
+# Try common SDK locations for android.jar, preferring newer installed APIs.
 PLATFORM_JAR=""
-for p in "$ANDROID_HOME/platforms/android-30/android.jar" \
-          "/usr/lib/android-sdk/platforms/android-30/android.jar" \
-          "/usr/lib/android-sdk/platforms/android-34/android.jar"; do
-    [ -f "$p" ] && PLATFORM_JAR="$p" && break
+for root in "${SDK_ROOTS[@]}"; do
+    [ -d "$root/platforms" ] || continue
+    latest="$(find "$root/platforms" -mindepth 2 -maxdepth 2 -name android.jar | sort -V | tail -1)"
+    [ -f "$latest" ] && PLATFORM_JAR="$latest" && break
 done
 
 if [ -z "$PLATFORM_JAR" ]; then
-    echo "ERROR: android.jar not found. Install platform SDK 34 or 35:"
+    echo "ERROR: android.jar not found. Install a platform SDK:"
     echo "  sdkmanager 'platforms;android-35'"
     exit 1
 fi
@@ -40,7 +65,7 @@ $JAVAC -source 8 -target 8 \
     -bootclasspath "$PLATFORM_JAR" \
     -classpath "$PLATFORM_JAR" \
     -d "$BUILD/obj" \
-    src/com/prism/demo/NotifyActivity.java
+    "$SCRIPT_DIR/src/com/prism/demo/NotifyActivity.java"
 
 # 3. Dex
 echo "▶ Dexing..."
@@ -51,7 +76,7 @@ $D8 --release \
 
 # 4. Package APK
 echo "▶ Packaging..."
-$AAPT package -f -M AndroidManifest.xml \
+$AAPT package -f -M "$SCRIPT_DIR/AndroidManifest.xml" \
     -I "$PLATFORM_JAR" \
     -F "$BUILD/prism_notify_unsigned.apk"
 
@@ -79,5 +104,5 @@ $ADB -s "$SERIAL" install -r "$SCRIPT_DIR/prism_notify.apk"
 
 echo ""
 echo "✓ Done! Test with:"
-echo "  adb -s $SERIAL shell am start -n com.prism.demo/.NotifyActivity \\"
-echo "    --es title 'System Update' --es text 'Visit github.com'"
+echo "  adb -s $SERIAL shell 'am start -n com.prism.demo/.NotifyActivity \\"
+echo "    --es title \"System Update\" --es text \"Visit github.com\"'"

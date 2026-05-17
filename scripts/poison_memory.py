@@ -39,9 +39,13 @@ _POISON_TAG = "PRISM_POISON"   # marker so we can clean up demo injections
 
 
 def _collection():
-    import chromadb
+    import chromadb, os, sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from embedding_fn import get_embedding_fn
     client = chromadb.PersistentClient(path=DB_PATH)
-    return client.get_or_create_collection(COLLECTION)
+    return client.get_or_create_collection(
+        COLLECTION, embedding_function=get_embedding_fn()
+    )
 
 
 def inject(text: str, tag: str = "general") -> str:

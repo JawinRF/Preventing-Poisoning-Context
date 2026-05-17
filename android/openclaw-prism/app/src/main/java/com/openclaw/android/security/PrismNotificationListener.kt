@@ -57,7 +57,9 @@ class PrismNotificationListener : NotificationListenerService() {
         if (sbn == null) return
         val extras = sbn.notification.extras
         val title = extras.getCharSequence("android.title")?.toString() ?: ""
-        val text = extras.getCharSequence("android.text")?.toString() ?: ""
+        // BigTextStyle stores body in android.bigText; android.text is the short summary
+        val bigText = extras.getCharSequence("android.bigText")?.toString() ?: ""
+        val text = bigText.ifBlank { extras.getCharSequence("android.text")?.toString() ?: "" }
         val full = "$title $text".trim()
         if (full.isBlank()) return
 

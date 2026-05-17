@@ -49,7 +49,9 @@ class PrismAccessibilityService : AccessibilityService() {
             eventTypes = AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
                     AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
-            notificationTimeout = 750L
+            // 2000ms instead of 750ms — reduces ONNX inference frequency on the
+            // emulator's 2-core CPU, preventing ANR in foreground apps.
+            notificationTimeout = 2000L
             flags = AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
         }
     }
@@ -75,14 +77,12 @@ class PrismAccessibilityService : AccessibilityService() {
 
                 val norm = Normalizer.normalize(rawText)
                 val l1 = PrismDetector.scan(norm.text)
-                val l2Prob = classifier?.classify(norm.text)?.maliciousProb ?: 0.0f
-                // Combined L1+L2 gate — mirrors the host-sidecar blocking logic.
-                val verdict = when {
-                    l2Prob >= 0.70f -> "BLOCK"
-                    l1.verdict == PrismDetector.Verdict.BLOCK && l2Prob >= 0.30f -> "BLOCK"
-                    l1.score >= 0.80f -> "BLOCK"
-                    else -> "ALLOW"
-                }
+
+                // L2 ONNX skipped here — the host Python shield (:8765) re-scans
+                // every field that reaches the agent anyway. Running ONNX on every
+                // accessibility event saturates the emulator CPU and causes ANR.
+                // On-device L1 rule check is sufficient for the audit log.
+                val verdict = if (l1.score >= 0.80f) "BLOCK" else "ALLOW"
 
                 MemShieldDb.get(this@PrismAccessibilityService).auditDao().insert(
                     AuditEntry(
@@ -90,7 +90,7 @@ class PrismAccessibilityService : AccessibilityService() {
                         snippet = norm.text.take(120),
                         verdict = verdict,
                         layer1Score = l1.score,
-                        layer2Prob = l2Prob,
+                        layer2Prob = 0.0f,
                         matchedRules = l1.matchedRules.joinToString(",")
                     )
                 )

@@ -310,9 +310,8 @@ if FASTAPI_AVAILABLE:
         return handle_inspect(request)
 
     @app.post("/v1/inspect/batch", dependencies=[Depends(_require_secret)])
-    def inspect_batch_route(request: Request) -> JSONResponse:
-        import asyncio
-        body = asyncio.get_event_loop().run_until_complete(request.json())
+    async def inspect_batch_route(request: Request) -> JSONResponse:
+        body = await request.json()
         results = handle_inspect_batch(body.get("items", []))
         return JSONResponse({"results": results})
 

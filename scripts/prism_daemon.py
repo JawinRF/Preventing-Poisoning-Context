@@ -462,7 +462,7 @@ def cmd_run(args) -> None:
     daemon = PrismDaemon(
         args.serial,
         enable_observer=not args.no_observer,
-        auto_queue=not args.no_auto_queue,
+        auto_queue=args.auto_queue,
     )
     daemon.start()
     daemon.wait()
@@ -479,8 +479,8 @@ def cmd_start(args) -> None:
     cmd = [sys.executable, __file__, "run", "--serial", args.serial]
     if args.no_observer:
         cmd.append("--no-observer")
-    if args.no_auto_queue:
-        cmd.append("--no-auto-queue")
+    if args.auto_queue:
+        cmd.append("--auto-queue")
 
     os.makedirs(os.path.dirname(_LOG), exist_ok=True)
     log_file = open(_LOG, "a")
@@ -571,8 +571,8 @@ commands:
                    help="Android emulator serial (default: %(default)s)")
     p.add_argument("--no-observer",   action="store_true",
                    help="Disable the DeviceObserver thread (no emulator available)")
-    p.add_argument("--no-auto-queue", action="store_true",
-                   help="Observer monitors only — do not auto-queue defensive tasks on BLOCK")
+    p.add_argument("--auto-queue", action="store_true",
+                   help="Auto-queue defensive tasks on BLOCK (off by default — prevents queue spam)")
 
     a = p.parse_args()
 
