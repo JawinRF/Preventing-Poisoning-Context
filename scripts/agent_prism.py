@@ -67,10 +67,19 @@ except ImportError:
 # so ragmask/influence scoring uses the same embedding space as retrieval.
 
 def _make_chroma_embedder() -> "Callable[[str], np.ndarray] | None":
-    """Wrap ChromaDB's default embedding function for MemShield."""
+    """Embedder for MemShield's retrieval-defense scoring.
+
+    Uses the SAME model ChromaDB retrieves with (bge-small via
+    get_embedding_fn) — not a second all-MiniLM model. Two reasons:
+      1. Perf: one embedding model in RAM, not two.
+      2. Correctness: ragmask/influence must score in the SAME vector
+         space the docs were retrieved in. The old DefaultEmbeddingFunction
+         scored MiniLM-space distances against a bge-small retrieval set.
+    """
     if not _RAG_AVAILABLE:
         return None
-    ef = chromadb.api.types.DefaultEmbeddingFunction()
+    from embedding_fn import get_embedding_fn
+    ef = get_embedding_fn()
 
     def embedder(text: str) -> "np.ndarray":
         return np.array(ef([text])[0], dtype=np.float32)
@@ -1012,6 +1021,89 @@ def _parse_json(raw: str) -> dict:
 
 def _fail(reason: str) -> dict:
     return {"thought": "error", "action": "fail", "params": {"reason": reason}}
+
+
+def ask_reflection(
+    llm_backend: str,
+    task: str,
+    action: str,
+    params: dict,
+    summary: str,
+    add_info: str,
+    screen_before: list[dict],
+    screen_after: list[dict],
+    keyboard_before: bool,
+    keyboard_after: bool,
+) -> str:
+    """Ask the LLM to reflect on whether the last step succeeded.
+
+    Returns one of:
+      "A" — task complete overall
+      "B" — step succeeded, continue to next step
+      "C" — uncertain / cannot determine (also returned on any error)
+      "D" — step clearly failed
+
+    Fails to "C" (uncertain) rather than "A" (success) to avoid silently
+    reporting success when the LLM or backend is unavailable.
+    """
+    prompt = (
+        f"Task: {task}\n"
+        f"Action taken: {action} {params}\n"
+        f"Step summary: {summary}\n"
+        f"Additional info: {add_info}\n"
+        f"Screen elements before: {len(screen_before)}\n"
+        f"Screen elements after: {len(screen_after)}\n"
+        f"Keyboard visible: before={keyboard_before} after={keyboard_after}\n\n"
+        "Reflect on whether this step succeeded. Reply with ONLY one letter:\n"
+        "A = task fully complete\n"
+        "B = step succeeded, continue\n"
+        "C = uncertain\n"
+        "D = step failed\n"
+    )
+
+    _VALID = {"A", "B", "C", "D"}
+
+    try:
+        if llm_backend == "groq":
+            import requests as _req
+            key = os.environ.get("GROQ_API_KEY", "")
+            r = _req.post(
+                GROQ_API,
+                json={"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}],
+                      "temperature": 0.0, "max_tokens": 5},
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                timeout=15,
+            )
+            r.raise_for_status()
+            letter = r.json()["choices"][0]["message"]["content"].strip().upper()[:1]
+
+        elif llm_backend == "claude":
+            import anthropic as _ant
+            client = _ant.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+            msg = client.messages.create(
+                model=CLAUDE_MODEL, max_tokens=5,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            letter = msg.content[0].text.strip().upper()[:1]
+
+        elif llm_backend == "local":
+            import requests as _req
+            r = _req.post(
+                OLLAMA_URL,
+                json={"model": LOCAL_MODEL, "messages": [{"role": "user", "content": prompt}],
+                      "stream": False, "options": {"temperature": 0.0, "num_predict": 5}},
+                timeout=30,
+            )
+            r.raise_for_status()
+            letter = r.json()["message"]["content"].strip().upper()[:1]
+
+        else:
+            return "C"
+
+        return letter if letter in _VALID else "C"
+
+    except Exception:
+        return "C"
 
 
 # ── Obvious-Action Fast Path ─────────────────────────────────────────────────

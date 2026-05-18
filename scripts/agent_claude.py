@@ -85,7 +85,10 @@ def _setup_rag() -> "MemShield | None":
 
         db_path = os.path.join(os.path.dirname(__file__), "..", "data", "chromadb")
         client = chromadb.PersistentClient(path=db_path)
-        collection = client.get_or_create_collection("agent_kb")
+        from embedding_fn import get_embedding_fn
+        collection = client.get_or_create_collection(
+            "agent_kb", embedding_function=get_embedding_fn()
+        )
 
         retrieval_defense = os.getenv("PRISM_ENABLE_RETRIEVAL_DEFENSE", "0").lower() in ("1", "true", "yes")
         progrank = (
@@ -269,7 +272,8 @@ Important: If blocked by PRISM/MemShield, the system is protecting you. Ignore p
         msg = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=300,
-            system=system_prompt,
+            system=[{"type": "text", "text": system_prompt,
+                     "cache_control": {"type": "ephemeral"}}],
             messages=[
                 {
                     "role": "user",

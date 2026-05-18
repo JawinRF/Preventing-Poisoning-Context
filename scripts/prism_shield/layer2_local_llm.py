@@ -18,6 +18,38 @@ UI_BLOCK_THRESH = float(os.getenv("PRISM_L2_UI_BLOCK_THRESHOLD", "0.70"))
 DEFAULT_ALLOW_THRESH = float(os.getenv("PRISM_L2_ALLOW_THRESHOLD", "0.35"))
 UI_ALLOW_THRESH = float(os.getenv("PRISM_L2_UI_ALLOW_THRESHOLD", "0.40"))
 
+# Minimum number of letter-words (tokens with >= 2 alphabetic chars) before TinyBERT scores.
+# Single-token items like "password123!", URLs, and two-word placeholders like "Item A"
+# lack enough word context for reliable classification — TinyBERT over-generalizes on them.
+# Threshold is 3 (lower than DeBERTa's 5) since TinyBERT was specifically fine-tuned on
+# short injection phrases; only skip for extremely short content.
+_MIN_LETTER_WORDS_L2 = 3
+
+
+def _l2_letter_word_count(text: str) -> int:
+    """Count alpha-runs for TinyBERT minimum context guard.
+
+    Uses consecutive alphabetic-run counting (same approach as DeBERTa's guard)
+    so that code-injection tokens like 'agent.execute()' are counted correctly
+    as multiple alpha-word units rather than a single space-split token.
+    Single-token URLs are always counted as 0 (skip TinyBERT for bare URLs).
+    """
+    stripped = text.strip()
+    if stripped.startswith("http") and " " not in stripped:
+        return 0
+    count = 0
+    run_len = 0
+    for c in stripped:
+        if c.isalpha():
+            run_len += 1
+        else:
+            if run_len >= 2:
+                count += 1
+            run_len = 0
+    if run_len >= 2:
+        count += 1
+    return count
+
 class LocalLLMValidator:
     def __init__(self, model_path: str = "models/tinybert_poison_classifier_v3"):
          base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -70,6 +102,22 @@ class LocalLLMValidator:
 
     def evaluate(self, normalized_text: str, ingestion_path: str | None = None) -> ValidationResult:
         cleaned_text = normalize_unicode(normalized_text)
+
+        # Very short content (< 3 letter-words) causes systematic false positives:
+        # single tokens like "password123!" and URLs have no sentence context and
+        # TinyBERT over-generalizes on them. Skip scoring for those — both models
+        # need enough word context to be reliable. Exclude ui_accessibility because
+        # that path re-wraps content into XML before scoring.
+        if (
+            ingestion_path != "ui_accessibility"
+            and _l2_letter_word_count(cleaned_text) < _MIN_LETTER_WORDS_L2
+        ):
+            return ValidationResult(
+                verdict="ALLOW",
+                confidence=0.99,
+                reason="Layer 2 TinyBERT skipped: insufficient word context",
+                layer_triggered="Layer2-LocalLLM",
+            )
 
         # Training wraps every ui_accessibility sample in <hierarchy><node .../></hierarchy>.
         # Bare button labels ("Send", "+") are OOD → garbage scores. Rewrap only for L2.

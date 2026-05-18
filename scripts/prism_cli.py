@@ -341,6 +341,7 @@ _CMD_HELP: dict[str, str] = {
     "/skill":   "RAG skill store            (add | list | show | del)",
     "/memory":  "Agent memory               (list | save <text> | clear)",
     "/watch":   "Start proactive daemon loop",
+    "/alert":   "Notification triggers       (add | list | del | pause | resume | test | status | reload)",
     "/status":  "Queue, routines, skills summary",
     "/help":    "Show all commands",
     "/clear":   "Clear terminal screen",

@@ -11,6 +11,24 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipe
 from .base import ValidationResult
 
 
+def _letter_word_count(text: str) -> int:
+    """Count space-split tokens that contain at least 2 alphabetic characters.
+
+    DeBERTa needs sentence-like context to score reliably. Pure codes, IDs, emails,
+    and phone numbers have very few letter-words and are systematically mis-scored.
+    Skipping DeBERTa for those avoids a class of calibration false positives while
+    letting TinyBERT (which was fine-tuned on short direct injections) cover the gap.
+
+    Uses space-split (not alpha-run counting) because dot-separated package names like
+    'com.example.app' are one semantic unit; counting their sub-tokens inflates the
+    count and incorrectly triggers DeBERTa on structured Android data.
+    """
+    return sum(
+        1 for token in text.split()
+        if sum(1 for c in token if c.isalpha()) >= 2
+    )
+
+
 class DeBERTaValidator:
     """ProtectAI DeBERTa prompt-injection classifier. BLOCK/QUARANTINE on INJECTION by confidence."""
 
@@ -21,6 +39,11 @@ class DeBERTaValidator:
     )
     BLOCK_THRESHOLD = 0.90  # INJECTION with confidence >= this -> BLOCK
     # INJECTION with confidence < BLOCK_THRESHOLD -> QUARANTINE
+
+    # Minimum number of letter-words required before DeBERTa scores the text.
+    # Codes, IDs, emails, and phone numbers have < 5 letter-words and cause
+    # systematic calibration false positives — TinyBERT handles those instead.
+    _MIN_LETTER_WORDS = 5
 
     def __init__(self) -> None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -38,6 +61,14 @@ class DeBERTaValidator:
         )
 
     def evaluate(self, normalized_text: str, ingestion_path: str = "") -> ValidationResult:
+        if _letter_word_count(normalized_text) < self._MIN_LETTER_WORDS:
+            return ValidationResult(
+                verdict="ALLOW",
+                confidence=0.99,
+                reason="Layer 3 DeBERTa skipped: insufficient natural-language context",
+                layer_triggered="Layer3-DeBERTa",
+            )
+
         out = self._classifier(normalized_text)[0]
         verdict_label = out["label"]
         confidence = out["score"]

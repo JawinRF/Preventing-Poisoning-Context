@@ -317,6 +317,11 @@ class ContextAssembler:
         # Only truly new or changed notifications reach the sidecar each step;
         # previously seen notifications are served from this dict in O(1).
         self._notif_seen: dict[int, InspectResult] = {}
+        # Per-run retrieval-defense cache. Key: rag query string (constant
+        # within a run). Value: (rag_context, rag_blocked, memory_context,
+        # skill_procedures). The corpus is static and the query fixed across
+        # steps, so the defended set is identical every step — compute once.
+        self._retrieval_cache: dict[str, tuple] = {}
         # Texts of blocked notifications (lowercased) — used to scrub screen
         # context so the agent cannot see blocked content via the UI path.
         self._blocked_notif_texts: set[str] = set()
@@ -453,11 +458,25 @@ class ContextAssembler:
         ctx.storage_data, stor_blocked = self._gather_storage()
         ctx.blocked_counts["shared_storage"] = stor_blocked
 
-        # 4. RAG Store (skills + KB) and agent memories (separate queries)
-        ctx.rag_context, rag_blocked = self._gather_rag(rag_query or task, recent_actions)
+        # 4. RAG Store (skills + KB) and agent memories.
+        # The corpus is static within a run and the query (task) is fixed,
+        # so the defended retrieval set is invariant across steps. Compute
+        # the full pipeline (ML scan + ragmask + influence) ONCE per query
+        # and serve every later step from cache — the heavy retrieval-defense
+        # cost is paid on step 1 only, not re-paid 15-20×.
+        _rkey = rag_query or task
+        _cached = self._retrieval_cache.get(_rkey)
+        if _cached is not None:
+            ctx.rag_context, rag_blocked, ctx.memory_context, ctx.skill_procedures = _cached
+        else:
+            ctx.rag_context, rag_blocked = self._gather_rag(_rkey, recent_actions)
+            ctx.memory_context = self._gather_memories(_rkey)
+            ctx.skill_procedures = self._gather_skill_procedures(_rkey)
+            self._retrieval_cache[_rkey] = (
+                ctx.rag_context, rag_blocked,
+                ctx.memory_context, ctx.skill_procedures,
+            )
         ctx.blocked_counts["rag_store"] = rag_blocked
-        ctx.memory_context = self._gather_memories(rag_query or task)
-        ctx.skill_procedures = self._gather_skill_procedures(rag_query or task)
 
         return ctx
 
