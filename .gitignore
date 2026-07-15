@@ -1,93 +1,59 @@
-# Python & Virtual environments
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-.Python
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+
+# Virtual environments
 env/
 venv/
 ENV/
-.venv
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-site-packages/
-
-# Virtual environments
-.venv
+.venv/
 .env
 
-# IDE
+# IDE / OS
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 *.iml
-
-# OS
 .DS_Store
 Thumbs.db
+.codex
 
-# Project specific
+# Logs, temp, runtime
 *.log
 *.tmp
-data/quarantine_store.jsonl
-data/audit_log.jsonl
-data/memshield_audit.jsonl
-data/memshield_quarantine.jsonl
-
-# Runtime-generated artifacts
 *.db
 *.db-shm
 *.db-wal
 *.key
+view.xml
+
+# Data and models (large / runtime-generated, rebuilt via scripts)
+data/
+models/
+memshield/data/
 
 # Android build artifacts
 .gradle/
 local.properties
 *.apk
 *.aab
+*.apk.idsig
 captures/
 *.hprof
+android/openclaw-prism/app/src/main/assets/www/
+android/openclaw-prism/app/src/main/assets/tinybert_prism.onnx
+android/openclaw-prism/www/dist/
+android/openclaw-prism/www/node_modules/
+openclaw-android/
 
 # Secrets
 anthropic/
-
-# Large model files (download separately)
-models/
-
-# Training data with synthetic tokens (triggers GitHub push protection)
-data/tinybert_training_dataset.parquet
-
-# Temp/generated files
-view.xml
-
-# ChromaDB runtime data
-data/
-
-openclaw-android/
-
-POC_PRESENTATION.md
-
-.codex
-
-DEMO_INSTRUCTIONS.md
-
-
-android/openclaw-prism/app/src/main/assets/www/
-android/openclaw-prism/www/dist/
-android/openclaw-prism/www/node_modules/
-android/openclaw-prism/app/src/main/assets/tinybert_prism.onnxmemshield/data
-memshield/data
-

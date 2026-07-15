@@ -17,11 +17,14 @@ Handled formats (in detection order):
 from __future__ import annotations
 
 import json
+import re
 from html.parser import HTMLParser
 import xml.etree.ElementTree as ET
 
 _FILE_START = "--- START FILE:"
 _FILE_END   = "--- END FILE ---"
+
+_XML_ILLEGAL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 # Only human-visible text attributes; class / resource-id are structural noise
 _XML_TEXT_ATTRS = ("text", "content-desc", "hint", "label")
@@ -56,7 +59,7 @@ class ContentExtractor:
 
     def _from_xml(self, xml_text: str) -> str:
         try:
-            root = ET.fromstring(xml_text)
+            root = ET.fromstring(_XML_ILLEGAL_CHARS.sub("", xml_text))
         except ET.ParseError:
             return ""
         tokens: list[str] = []

@@ -1539,7 +1539,9 @@ def _record_experience(
             logger.info(f"Memory stored: {doc[:80]} (trust={birth_trust:.2f})")
             # Wire lineage edges: all T3 + ChromaDB sources in session → new memory
             if lineage and session_id:
-                n_parents = lineage.record_save(session_id, doc_id)
+                n_parents = lineage.record_save(
+                    session_id, doc_id, label=doc, task=task
+                )
                 logger.info(
                     f"[Lineage] auto-memory {doc_id[:12]} ← {n_parents} parent(s)"
                 )
@@ -1598,6 +1600,10 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
     print(f"  Task: {task}")
     print(f"  LLM:  {llm.upper()}  |  Serial: {serial}")
     print(f"{CYAN}{'='*60}{RESET}")
+
+    _lin, _sid = get_active()
+    if _lin and _sid:
+        _lin.set_session_task(_sid, task)
 
     # Connect to emulator
     d = u2.connect(serial)

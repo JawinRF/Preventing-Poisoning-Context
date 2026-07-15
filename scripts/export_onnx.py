@@ -1,18 +1,16 @@
 """
 export_onnx.py - PyTorch -> ONNX for Android (onnxruntime-android)
 """
-import argparse, os
+import argparse, os, shutil, tempfile
 from pathlib import Path
 
 import onnx
 from onnxruntime.quantization import QuantType, quantize_dynamic
-import torch
-from transformers import AutoModelForSequenceClassification
+from optimum.onnxruntime import ORTModelForSequenceClassification
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_dir", default="models/tinybert_poison_classifier_v3")
 parser.add_argument("--output",    default="android/openclaw-prism/app/src/main/assets/tinybert_prism.onnx")
-parser.add_argument("--seq_len",   type=int, default=128)
 parser.add_argument(
     "--quantize-dynamic",
     action=argparse.BooleanOptionalAction,
@@ -21,29 +19,17 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-print("[1/2] Loading model from", args.model_dir)
-model = AutoModelForSequenceClassification.from_pretrained(args.model_dir)
-model.eval()
-
 output_path = Path(args.output)
 fp32_output = output_path.with_suffix(".fp32.onnx") if args.quantize_dynamic else output_path
-
-print("[2/2] Exporting to ONNX ...")
 os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
-dummy_ids  = torch.zeros(1, args.seq_len, dtype=torch.long)
-dummy_mask = torch.ones(1,  args.seq_len, dtype=torch.long)
-dummy_type = torch.zeros(1, args.seq_len, dtype=torch.long)
+print("[1/3] Exporting", args.model_dir, "to ONNX via optimum ...")
+with tempfile.TemporaryDirectory() as tmp:
+    ort_model = ORTModelForSequenceClassification.from_pretrained(args.model_dir, export=True)
+    ort_model.save_pretrained(tmp)
+    shutil.move(os.path.join(tmp, "model.onnx"), str(fp32_output))
 
-torch.onnx.export(
-    model,
-    (dummy_ids, dummy_mask, dummy_type),
-    str(fp32_output),
-    input_names  = ["input_ids", "attention_mask", "token_type_ids"],
-    output_names = ["logits"],
-    opset_version = 18,
-)
-
+print("[2/3] Checking model ...")
 onnx.checker.check_model(onnx.load(str(fp32_output)))
 
 if args.quantize_dynamic:

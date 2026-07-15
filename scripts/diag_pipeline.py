@@ -1,4 +1,4 @@
-# scripts/test_pipeline.py
+# scripts/diag_pipeline.py
 import json
 import time
 from prism_shield.base import MemoryEntry

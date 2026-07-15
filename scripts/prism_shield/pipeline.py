@@ -18,6 +18,16 @@ Ensemble (Step 3):
     Disagree    → QUARANTINE (one model uncertain — route for review)
     Both ALLOW  → ALLOW
 
+L3-advisory paths:
+  DeBERTa is a frozen generalist trained on natural-language prompts. On paths
+  whose extracted payload is structurally non-prompt-like (UI node label soup,
+  RAG store records), its BLOCK verdicts are dominated by false positives while
+  TinyBERT is trained in-distribution on exactly those payloads. On paths in
+  PRISM_L3_ADVISORY_PATHS (default: ui_accessibility, rag_store), an L3 BLOCK
+  opposed by an L2 ALLOW at >= PRISM_L2_OVERRIDE_CONFIDENCE (default 0.99)
+  benign probability resolves to ALLOW. L3 keeps full veto power on every
+  other path.
+
 QUARANTINE resolution:
   Single-model QUARANTINE (medium-confidence injection from one model) is resolved
   before ensemble: it becomes BLOCK for untrusted paths, ALLOW for agent output.
@@ -27,6 +37,7 @@ QUARANTINE resolution:
 from __future__ import annotations
 
 import concurrent.futures
+import os
 
 from .base import MemoryEntry, ValidationResult
 from .normalizer import Normalizer
@@ -51,6 +62,15 @@ class PrismShield:
 
     # Paths where a single-model QUARANTINE resolves to ALLOW (agent's own output)
     _LENIENT_PATHS = frozenset({"agent_output"})
+
+    _L3_ADVISORY_PATHS = frozenset(
+        p.strip()
+        for p in os.getenv(
+            "PRISM_L3_ADVISORY_PATHS", "ui_accessibility,rag_store"
+        ).split(",")
+        if p.strip()
+    )
+    _L2_OVERRIDE_CONFIDENCE = float(os.getenv("PRISM_L2_OVERRIDE_CONFIDENCE", "0.99"))
 
     # ── Quarantine resolution ────────────────────────────────────────────────
 
@@ -118,6 +138,23 @@ class PrismShield:
                 verdict="ALLOW",
                 confidence=l2.confidence,
                 reason=f"[Ensemble: L3 uncertain, L2 confident safe] {l2.reason}",
+                layer_triggered="Ensemble",
+                normalized_text=normalized,
+            )
+
+        if (
+            l3.verdict == "BLOCK"
+            and l2.verdict == "ALLOW"
+            and path in self._L3_ADVISORY_PATHS
+            and l2.confidence >= self._L2_OVERRIDE_CONFIDENCE
+        ):
+            return ValidationResult(
+                verdict="ALLOW",
+                confidence=l2.confidence,
+                reason=(
+                    f"[Ensemble: L3 advisory on {path} — L2 confident benign "
+                    f"({l2.confidence:.3f}) overrides L3 BLOCK ({l3.confidence:.3f})] {l2.reason}"
+                ),
                 layer_triggered="Ensemble",
                 normalized_text=normalized,
             )

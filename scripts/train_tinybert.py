@@ -8,10 +8,18 @@ from transformers import TrainingArguments, Trainer
 import torch
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 try:
     from unicode_defense import normalize_unicode, confusable_augment
 except ModuleNotFoundError:  # pragma: no cover
     from memshield_unicode_defense import normalize_unicode, confusable_augment  # type: ignore[import]  # noqa: F401
+
+from prism_shield.base import MemoryEntry
+from prism_shield.content_extractor import ContentExtractor
+from prism_shield.normalizer import Normalizer
 
 MODEL_NAME = "models/tinybert_poison_classifier"
 DATA_PATH = "data/prism_training_dataset.json"
@@ -23,8 +31,20 @@ with open(DATA_PATH, "r", encoding="utf-8") as f:
     data = json.load(f)
 df = pd.DataFrame(data)
 
-# Apply Unicode hardening to all texts so training matches inference preprocessing.
-df["text"] = df["text"].map(normalize_unicode)
+# Match the inference pipeline exactly: ContentExtractor, then the full
+# Normalizer (URL decode, base64 expansion, invisible-char/ANSI strip,
+# whitespace compression, Unicode hardening).
+_extractor  = ContentExtractor()
+_normalizer = Normalizer()
+
+
+def _preprocess(row):
+    path = row.get("ingestion_path", "")
+    text = _extractor.extract(row["text"], path) or row["text"]
+    return _normalizer.normalize(MemoryEntry(id="", text=text, ingestion_path=path))
+
+
+df["text"] = df.apply(_preprocess, axis=1)
 
 # simple sanity: map label strings to integers 0/1
 df["label"] = df["label"].map({"benign": 0, "poisoned": 1})
@@ -33,9 +53,9 @@ df["label"] = df["label"].map({"benign": 0, "poisoned": 1})
 # Oversample weak ingestion paths identified via red-team results.
 WEAK_CATEGORIES = {
     "ui_accessibility",
-    "notification",
+    "notifications",
     "network_responses",
-    "inter_app_intent",
+    "android_intents",
 }
 DEFAULT_AUG_COPIES = 1
 WEAK_AUG_COPIES = 2
@@ -72,9 +92,8 @@ data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 def tokenize_batch(batch):
     return tokenizer(
         batch["text"],
-        padding="max_length",
         truncation=True,
-        max_length=256
+        max_length=128
     )
 
 # tokenization (keep label column)
@@ -113,7 +132,7 @@ training_args = TrainingArguments(
     logging_steps=100,
     load_best_model_at_end=True,
     metric_for_best_model="f1",
-    fp16=True,                  # use mixed precision if available
+    fp16=torch.cuda.is_available(),
     push_to_hub=False,
 )
 

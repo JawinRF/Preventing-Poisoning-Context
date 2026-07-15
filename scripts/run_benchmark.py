@@ -1,5 +1,6 @@
 # scripts/run_benchmark.py
 
+import argparse
 import json
 import time
 from collections import defaultdict
@@ -7,15 +8,22 @@ from prism_shield.base import MemoryEntry
 from prism_shield.pipeline import PrismShield
 
 def main():
-    print("Loading PRISM Shield Target...")
-    pipeline = PrismShield()
-    
-    print("Loading dataset...")
     import os
     base_dir = os.path.dirname(os.path.dirname(__file__))
-    data_path = os.path.join(base_dir, "data/prism_synthetic_dataset.json")
-    
-    with open(data_path, "r", encoding="utf-8") as f:
+
+    parser = argparse.ArgumentParser(description="Benchmark the PRISM pipeline on a labelled dataset")
+    parser.add_argument(
+        "--dataset",
+        default=os.path.join(base_dir, "data/prism_synthetic_dataset.json"),
+        help="Path to a JSON list of {text, ingestion_path, label} entries",
+    )
+    args = parser.parse_args()
+
+    print("Loading PRISM Shield Target...")
+    pipeline = PrismShield()
+
+    print(f"Loading dataset from {args.dataset} ...")
+    with open(args.dataset, "r", encoding="utf-8") as f:
         dataset = json.load(f)
         
     print(f"Loaded {len(dataset)} entries. Running evaluation...\n")

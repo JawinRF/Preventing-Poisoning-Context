@@ -75,14 +75,12 @@ Handled formats:
 - Whitespace flood compression
 - Unicode confusable normalization
 
-**TinyBERT v3** (Layer 2) — 44K-sample fine-tuned binary classifier, runs as a shared ONNX artifact on both host and Android (`tinybert_prism.onnx`). Path-aware thresholds:
+**TinyBERT v3** (Layer 2) — 44K-sample fine-tuned binary classifier, runs as a shared ONNX artifact on both host and Android (`tinybert_prism.onnx`). Training applies the identical preprocessing the inference pipeline applies (ContentExtractor, then the full Normalizer), so the model is in-distribution on every ingestion path. Uniform thresholds:
 
 | Env var | Default | Scope |
 |---------|---------|-------|
 | `PRISM_L2_BLOCK_THRESHOLD` | `0.85` | All paths |
-| `PRISM_L2_UI_BLOCK_THRESHOLD` | `0.70` | `ui_accessibility` |
 | `PRISM_L2_ALLOW_THRESHOLD` | `0.35` | All paths |
-| `PRISM_L2_UI_ALLOW_THRESHOLD` | `0.40` | `ui_accessibility` |
 
 Both TinyBERT and DeBERTa apply a minimum context guard before scoring: texts that are too short for reliable ML assessment (sparse alphabetic content) are skipped by that layer. TinyBERT uses an alpha-run count threshold of 3; DeBERTa uses a space-word count threshold of 5. This avoids systematic calibration failures on short structured tokens (confirmation codes, phone numbers, bare URLs) while preserving detection of short natural-language injections.
 
@@ -105,6 +103,10 @@ Single-model QUARANTINE (medium-confidence signal) is resolved before the ensemb
 
 When one model returns QUARANTINE and the other returns ALLOW with very high safety confidence (injection probability < 10%), the pipeline trusts the confident-safe verdict and returns ALLOW. This handles cases where TinyBERT is uncertain on legitimate natural-language text that DeBERTa has high confidence is benign.
 
+**L3-advisory paths.** DeBERTa is a frozen generalist trained on natural-language prompts. On paths whose extracted payload is structurally non-prompt-like (UI node label soup, RAG store records) its BLOCK verdicts are dominated by false positives, while TinyBERT is trained in-distribution on exactly those payloads. On paths in `PRISM_L3_ADVISORY_PATHS` (default `ui_accessibility,rag_store`), an L3 BLOCK opposed by an L2 ALLOW at ≥ `PRISM_L2_OVERRIDE_CONFIDENCE` (default `0.99`) benign probability resolves to ALLOW. L3 keeps full veto power on every other path.
+
+**Quarantine tickets.** Every final QUARANTINE verdict from `/v1/inspect` mints a persistent review ticket (JSONL-backed, survives sidecar restarts), retrievable at `GET /v1/ticket/<id>`. The response carries the `ticket_id` and a quarantine placeholder instead of the original text.
+
 **Active ingestion paths:**
 
 | Path | Description |
@@ -119,27 +121,26 @@ When one model returns QUARANTINE and the other returns ALLOW with very high saf
 | `network_responses` | HTTP / API responses |
 | `ui_accessibility` | Accessibility tree text nodes |
 
-**Benchmark performance** on the 1,498-entry synthetic evaluation set:
+**Benchmark performance** on the 1,498-entry synthetic evaluation set (full pipeline, QUARANTINE counted as a positive prediction):
 
 | Metric | Value |
 |--------|-------|
-| Detection Rate (TPR) | 99.8% |
-| False Positive Rate | 7.5% |
-| Accuracy | 95.4% |
-| Precision | 89.7% |
-| F1 | 0.945 |
+| Detection Rate (TPR) | 99.8% (594/595) |
+| False Positive Rate | 0.0% (0/903) |
+| Accuracy | 99.9% |
+| Precision | 100.0% |
+| F1 | 0.999 |
 
-Per-path FPR:
+Per-path: 0.0% FPR on all seven paths; 100% recall on six paths, 98.8% on `android_intents` (one missed sample). Mean end-to-end latency 100-220 ms per entry on CPU.
 
-| Path | FPR |
-|------|-----|
-| android_intents | 0.0% |
-| clipboard | 0.0% |
-| network_responses | 0.0% |
-| notifications | 0.0% |
-| rag_store | 18.6% |
-| shared_storage | 0.0% |
-| ui_accessibility | 34.1% |
+**External held-out benchmark** (`data/prism_external_benchmark.json`, built by `scripts/build_external_benchmark.py`): 2,810 entries from datasets never used in training — Lakera Gandalf real injection attempts, deepset and safe-guard test splits, real SMS ham, AG News, Banking77 — decontaminated against all training corpora by normalized text match and wrapped in the same Android containers. This measures generalization rather than template fit:
+
+| Metric | Full pipeline | TinyBERT alone |
+|--------|--------------|----------------|
+| False positive rate | 2.3% | 0.1% |
+| Detection rate | 96.8% | 97.8% |
+
+Run it with `python scripts/run_benchmark.py --dataset data/prism_external_benchmark.json`. The pipeline FPR above TinyBERT's own is DeBERTa disagreement routing benign external prose to QUARANTINE review on non-advisory paths, the intended defense-in-depth posture.
 
 ---
 

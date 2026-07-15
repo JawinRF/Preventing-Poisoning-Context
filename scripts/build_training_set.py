@@ -11,16 +11,25 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import random
 import uuid
 import sys
 from pathlib import Path
+from xml.sax.saxutils import quoteattr
 
 import pandas as pd
 
 # ── Add generators to path ──────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from generators.rag_generator import RAGGenerator
+from generators.intent_generator import IntentGenerator
+from generators.clipboard_generator import ClipboardGenerator
+from generators.ui_generator import UIGenerator
+from generators.notification_generator import NotificationGenerator
+from generators.storage_generator import StorageGenerator
+from generators.network_generator import NetworkGenerator
 from generators.payloads import (
     ALL_ATTACK_PAYLOADS,
     PAYLOAD_CATEGORIES,
@@ -78,7 +87,7 @@ def wrap_notification(text: str) -> tuple[str, str]:
         "time": f"{hour}:{minute:02d} {ampm}",
         "priority": random.choice(["default", "high", "low"]),
     })
-    return notif, "notification"
+    return notif, "notifications"
 
 
 def wrap_clipboard(text: str) -> tuple[str, str]:
@@ -112,9 +121,9 @@ def wrap_ui_xml(text: str) -> tuple[str, str]:
     benign_nodes_xml = ""
     for bn in random.choices(BENIGN_UI_NODES, k=benign_count):
         b_cls = bn["class"]
-        b_text = bn["text"]
-        b_desc = bn["content-desc"]
-        benign_nodes_xml += f'  <node index="0" class="{b_cls}" text="{b_text}" content-desc="{b_desc}" clickable="true" visible-to-user="true" bounds="[0,0][100,100]" />\n'
+        b_text = quoteattr(bn["text"])
+        b_desc = quoteattr(bn["content-desc"])
+        benign_nodes_xml += f'  <node index="0" class="{b_cls}" text={b_text} content-desc={b_desc} clickable="true" visible-to-user="true" bounds="[0,0][100,100]" />\n'
 
     # The target node (could be hidden for poisoned)
     visible = random.choice(["true", "false"])
@@ -122,7 +131,7 @@ def wrap_ui_xml(text: str) -> tuple[str, str]:
 
     xml = f'<?xml version="1.0" encoding="UTF-8"?>\n<hierarchy rotation="0">\n'
     xml += benign_nodes_xml
-    xml += f'  <node index="0" class="{cls}" text="{text}" content-desc="" resource-id="{rid}" clickable="false" visible-to-user="{visible}" bounds="{bounds}" />\n'
+    xml += f'  <node index="0" class="{cls}" text={quoteattr(text)} content-desc="" resource-id="{rid}" clickable="false" visible-to-user="{visible}" bounds="{bounds}" />\n'
     xml += "</hierarchy>"
     return xml, "ui_accessibility"
 
@@ -143,7 +152,7 @@ def wrap_rag_document(text: str) -> tuple[str, str]:
         "",
         "\n\n[Source: internal knowledge base]",
     ]
-    return f"{random.choice(prefixes)}{text}{random.choice(suffixes)}", "rag_knowledge"
+    return f"{random.choice(prefixes)}{text}{random.choice(suffixes)}", "rag_store"
 
 
 def wrap_file_content(text: str) -> tuple[str, str]:
@@ -154,7 +163,17 @@ def wrap_file_content(text: str) -> tuple[str, str]:
 
 def wrap_network_response(text: str) -> tuple[str, str]:
     """Wrap text as a network API/web response."""
-    style = random.choice(["json_field", "html_embed", "raw_append"])
+    style = random.choice(["json_field", "html_embed", "raw_append", "prose_then_json"])
+    if style == "prose_then_json":
+        base = random.choice([
+            "Welcome to our site Here is some content.",
+            "Request completed. See response payload below.",
+            "Page loaded successfully. Embedded data follows.",
+        ])
+        return (
+            f'{base} {{"status": "success", "data": {json.dumps(text)}}}',
+            "network_responses",
+        )
     if style == "json_field":
         base = random.choice(BENIGN_NETWORK_RESPONSES)
         if base.startswith("{"):
@@ -184,7 +203,7 @@ def wrap_intent(text: str) -> tuple[str, str]:
         "extras": {"text": text},
         "component": f"com.{random.choice(['whatsapp', 'chrome', 'gmail', 'sms'])}.app/.MainActivity",
     })
-    return intent, "inter_app_intent"
+    return intent, "android_intents"
 
 
 WRAPPERS = [
@@ -201,6 +220,17 @@ WRAPPERS = [
 def wrap_random(text: str) -> tuple[str, str]:
     """Apply a random Android format wrapper. Returns (wrapped_text, ingestion_path)."""
     return random.choice(WRAPPERS)(text)
+
+
+_SYNTH_GENERATORS = [
+    RAGGenerator(),
+    IntentGenerator(),
+    ClipboardGenerator(),
+    UIGenerator(),
+    NotificationGenerator(),
+    StorageGenerator(),
+    NetworkGenerator(),
+]
 
 
 def make_id(prefix: str = "ext") -> str:
@@ -279,6 +309,53 @@ def load_xstest() -> list[tuple[str, bool]]:
         return []
     df = pd.read_parquet(path)
     return [(row["prompt"], False) for _, row in df.iterrows()]
+
+
+def eval_holdout(text: str) -> bool:
+    """Deterministic 20% eval partition for single-split corpora (SMS ham).
+
+    Shared with build_external_benchmark.py: rows where this returns True are
+    reserved for the external benchmark and MUST NOT enter training.
+    """
+    digest = hashlib.sha256(text.strip().lower().encode()).hexdigest()[:8]
+    return int(digest, 16) / 0xFFFFFFFF >= 0.80
+
+
+def load_gandalf_train() -> list[tuple[str, bool]]:
+    """Lakera gandalf train split — real injection attempts. Val/test are eval-only."""
+    path = EXT_DIR / "eval_gandalf" / "eval_gandalf_train.parquet"
+    if not path.exists():
+        return []
+    df = pd.read_parquet(path)
+    return [(row["text"], True) for _, row in df.iterrows()]
+
+
+def load_sms_ham_train() -> list[tuple[str, bool]]:
+    """UCI SMS ham (benign) — 80% train partition; 20% reserved for eval."""
+    path = EXT_DIR / "eval_sms_ham" / "eval_sms_ham.parquet"
+    if not path.exists():
+        return []
+    df = pd.read_parquet(path)
+    ham = df[df["label"] == 0]["sms"].astype(str)
+    return [(t, False) for t in ham if not eval_holdout(t)]
+
+
+def load_ag_news_train(max_samples: int = 4000) -> list[tuple[str, bool]]:
+    """AG News train split (benign news texture). Test split is eval-only."""
+    path = EXT_DIR / "ag_news_train" / "ag_news_train.parquet"
+    if not path.exists():
+        return []
+    df = pd.read_parquet(path).sample(frac=1.0, random_state=13).head(max_samples)
+    return [(row["text"], False) for _, row in df.iterrows()]
+
+
+def load_banking77_train(max_samples: int = 3000) -> list[tuple[str, bool]]:
+    """Banking77 train split (benign user utterances). Test split is eval-only."""
+    path = EXT_DIR / "banking77_train" / "banking77_train.parquet"
+    if not path.exists():
+        return []
+    df = pd.read_parquet(path).sample(frac=1.0, random_state=13).head(max_samples)
+    return [(row["text"], False) for _, row in df.iterrows()]
 
 
 def load_llmail_inject(max_samples: int = 10000) -> list[tuple[str, bool]]:
@@ -415,6 +492,10 @@ def main():
         ("chatbot_instructions", load_chatbot_instructions),
         ("xstest", load_xstest),
         ("llmail_inject", load_llmail_inject),
+        ("gandalf_train", load_gandalf_train),
+        ("sms_ham_train", load_sms_ham_train),
+        ("ag_news_train", load_ag_news_train),
+        ("banking77_train", load_banking77_train),
     ]
 
     all_external: list[dict] = []
@@ -464,13 +545,42 @@ def main():
             src = random.choice(ext_benign)
             # Re-wrap the original text in a different format
             # Extract original text from the wrapped version — use a benign template instead
-            benign_text = random.choice(
-                BENIGN_NOTIFICATION_TEXTS + BENIGN_CLIPBOARD_TEXTS +
-                BENIGN_RAG_DOCUMENTS +
-                [c for _, c in BENIGN_FILE_CONTENTS] +
-                BENIGN_NETWORK_RESPONSES
-            )
-            wrapped, ingestion_path = wrap_random(benign_text)
+            roll = random.random()
+            if roll < 0.30:
+                gen = random.choice(_SYNTH_GENERATORS)
+                sample = gen.generate_benign(1)[0]
+                wrapped, ingestion_path = sample["text"], sample["ingestion_path"]
+            elif roll < 0.40:
+                intent = dict(random.choice(BENIGN_INTENT_DATA))
+                pkg = random.choice([
+                    "com.whatsapp.app", "com.chrome.app", "com.gmail.app",
+                    "com.google.android.browser", "com.android.dialer",
+                    "com.google.android.apps.maps", "com.android.contacts",
+                ])
+                intent["component"] = f"{pkg}/.MainActivity"
+                wrapped, ingestion_path = json.dumps(intent), "android_intents"
+            elif roll < 0.55:
+                nodes_xml = ""
+                for bn in random.choices(BENIGN_UI_NODES, k=random.randint(3, 8)):
+                    nodes_xml += (
+                        f'  <node index="0" class="{bn["class"]}" '
+                        f'text={quoteattr(bn["text"])} '
+                        f'content-desc={quoteattr(bn["content-desc"])} '
+                        'clickable="true" visible-to-user="true" bounds="[0,0][100,100]" />\n'
+                    )
+                wrapped = (
+                    '<?xml version="1.0" encoding="UTF-8"?>\n<hierarchy rotation="0">\n'
+                    f'{nodes_xml}</hierarchy>'
+                )
+                ingestion_path = "ui_accessibility"
+            else:
+                benign_text = random.choice(
+                    BENIGN_NOTIFICATION_TEXTS + BENIGN_CLIPBOARD_TEXTS +
+                    BENIGN_RAG_DOCUMENTS +
+                    [c for _, c in BENIGN_FILE_CONTENTS] +
+                    BENIGN_NETWORK_RESPONSES
+                )
+                wrapped, ingestion_path = wrap_random(benign_text)
             extra_benign.append({
                 "id": make_id("fill"),
                 "ingestion_path": ingestion_path,

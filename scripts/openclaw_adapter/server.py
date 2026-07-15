@@ -36,15 +36,20 @@ MEMSHIELD_SRC_DIR = SCRIPTS_DIR.parent / "memshield" / "src"
 if str(MEMSHIELD_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(MEMSHIELD_SRC_DIR))
 
+import uuid
+
 from openclaw_adapter.audit import log_audit
 from openclaw_adapter.models import InspectRequest, InspectResponse
+from openclaw_adapter.quarantine_store import get_ticket, save_ticket, utc_now_iso
 from openclaw_adapter.source_mapper import map_ingestion_path
 from memshield import FailurePolicy, MemShield, ShieldConfig
 from prism_shield import MemoryEntry, PrismShield
+from prism_shield.base import FinalizedTicket
 from prism_shield.ui_extractor import UIExtractor
 
 
 BLOCK_PLACEHOLDER = "[PRISM_BLOCKED untrusted context removed before model assembly]"
+QUARANTINE_PLACEHOLDER = "[PRISM_QUARANTINED suspicious context pending verification]"
 DEFAULT_HOST = os.getenv("PRISM_SIDECAR_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.getenv("PRISM_SIDECAR_PORT", "8765"))
 ENABLE_MEMSHIELD_RAG = os.getenv("PRISM_ENABLE_MEMSHIELD_RAG", "1").lower() not in {"0", "false", "no"}
@@ -60,8 +65,10 @@ _rate_windows: dict[str, collections.deque] = {}
 def _check_rate_limit(session_id: str) -> bool:
     """Return True if request is allowed, False if rate limited."""
     now = _time.monotonic()
+    if len(_rate_windows) > 1024:
+        for sid in [s for s, w in _rate_windows.items() if not w or w[-1] < now - 60.0]:
+            del _rate_windows[sid]
     window = _rate_windows.setdefault(session_id, collections.deque())
-    # Purge entries older than 1 second
     while window and window[0] < now - 1.0:
         window.popleft()
     if len(window) >= _RATE_LIMIT_MAX:
@@ -207,9 +214,23 @@ def handle_inspect(request: InspectRequest) -> InspectResponse:
             )
 
         placeholder = None
-        ticket_id = None
+        ticket_id = result.ticket_id
         if result.verdict == "BLOCK":
             placeholder = BLOCK_PLACEHOLDER
+        elif result.verdict == "QUARANTINE":
+            placeholder = QUARANTINE_PLACEHOLDER
+            if not ticket_id:
+                ticket_id = f"qt-{uuid.uuid4().hex[:12]}"
+                save_ticket(
+                    FinalizedTicket(
+                        ticket_id=ticket_id,
+                        status="PENDING",
+                        confidence=result.confidence,
+                        reason=result.reason,
+                        layer_triggered=result.layer_triggered,
+                        created_at=utc_now_iso(),
+                    )
+                )
 
         audit = _build_audit(request, ingestion_path, ticket_id)
         log_audit(
@@ -237,6 +258,10 @@ def handle_inspect(request: InspectRequest) -> InspectResponse:
     except HTTPException:
         raise
     except Exception:
+        logger.exception(
+            f"handle_inspect failed for entry {request.entry_id} "
+            f"(path={ingestion_path}) — failing closed"
+        )
         audit = _build_audit(request, ingestion_path)
         log_audit(
             request.entry_id,
@@ -318,6 +343,20 @@ if FASTAPI_AVAILABLE:
     @app.get("/health")
     def health_route() -> dict[str, str]:
         return health()
+
+    @app.get("/v1/ticket/{ticket_id}")
+    def get_ticket_route(ticket_id: str) -> dict:
+        ticket = get_ticket(ticket_id)
+        if ticket is None:
+            raise HTTPException(status_code=404, detail="ticket_not_found")
+        return {
+            "ticket_id": ticket.ticket_id,
+            "status": ticket.status,
+            "confidence": ticket.confidence,
+            "reason": ticket.reason,
+            "layer_triggered": ticket.layer_triggered,
+            "created_at": ticket.created_at,
+        }
 else:
     app = None
 
@@ -346,6 +385,21 @@ class PrismRequestHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/health":
                 self._send_json(200, health())
+                return
+
+            if parsed.path.startswith("/v1/ticket/"):
+                ticket_id = parsed.path[len("/v1/ticket/"):]
+                ticket = get_ticket(ticket_id)
+                if ticket is None:
+                    raise HTTPException(status_code=404, detail="ticket_not_found")
+                self._send_json(200, {
+                    "ticket_id": ticket.ticket_id,
+                    "status": ticket.status,
+                    "confidence": ticket.confidence,
+                    "reason": ticket.reason,
+                    "layer_triggered": ticket.layer_triggered,
+                    "created_at": ticket.created_at,
+                })
                 return
 
             self._send_json(404, {"detail": "not_found"})

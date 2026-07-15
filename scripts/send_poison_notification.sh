@@ -55,7 +55,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "   Poison notification sent!"
 echo ""
 echo "  Next step: Run the agent with a normal task:"
-echo "    python scripts/agent.py --task 'Add a new todo: Buy groceries'"
+echo "    python scripts/agent_prism.py --task 'Add a new todo: Buy groceries'"
 echo ""
 echo "  The agent should get hijacked into opening github.com"
 echo "  instead of using the todo app."

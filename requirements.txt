@@ -1,0 +1,35 @@
+# PRISM — Python runtime dependencies
+# Derived from the actual third-party imports across scripts/ on 2026-05-17.
+# Install:  pip install -r requirements.txt
+# (memshield is a local package — install separately: pip install -e memshield)
+
+# ── Agent runtime ────────────────────────────────────────────────────────────
+anthropic>=0.86.0           # Claude backend (default LLM)
+requests>=2.32.0            # HTTP to PRISM :8765 / sidecar / LLM APIs
+uiautomator2>=3.5.0         # Android UI automation channel
+
+# ── RAG / retrieval ──────────────────────────────────────────────────────────
+chromadb>=1.5.5             # vector store (agent_kb: skills + memories + KB)
+# REQUIRED for the local embedder. embedding_fn.py raises without it: the
+# store is embedded with BAAI/bge-small-en-v1.5 and any substitute embedder
+# returns wrong similarities (see scripts/embedding_fn.py, reembed_store.py).
+sentence-transformers>=2.7.0
+
+# ── Sidecar server (:8765) ───────────────────────────────────────────────────
+fastapi>=0.115.0            # primary /v1/inspect transport
+uvicorn>=0.30.0             # ASGI server for FastAPI
+pydantic>=2.0.0             # InspectRequest/InspectResponse models
+
+# ── ML / scanning ────────────────────────────────────────────────────────────
+onnxruntime>=1.20.0         # on-host TinyBERT/DeBERTa ONNX scan
+transformers>=5.0.0         # tokenizers / model loading
+torch>=2.0.0                # sentence-transformers + transformers backend
+numpy>=1.26.0
+
+# ── Training / export / benchmark / tests (not needed for the live demo) ─────
+scikit-learn>=1.3.0
+pandas>=2.0.0
+datasets>=2.0.0
+onnx>=1.16.0                # export_onnx.py model checking
+optimum[onnxruntime]>=2.0.0 # HF → ONNX export path
+pytest>=8.0.0

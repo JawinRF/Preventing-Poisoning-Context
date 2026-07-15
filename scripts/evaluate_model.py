@@ -1,12 +1,36 @@
-import pandas as pd
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
-MODEL_PATH = "models/tinybert_poison_classifier"
-DATA_PATH = "data/tinybert_training_dataset.parquet"
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-df = pd.read_parquet(DATA_PATH)
+from prism_shield.base import MemoryEntry
+from prism_shield.content_extractor import ContentExtractor
+from prism_shield.normalizer import Normalizer
+
+MODEL_PATH = "models/tinybert_poison_classifier_v3"
+DATA_PATH = "data/prism_training_dataset.json"
+
+import json
+with open(DATA_PATH, encoding="utf-8") as _f:
+    _data = json.load(_f)
+import pandas as pd
+df = pd.DataFrame(_data)
+df["label"] = df["label"].map({"benign": 0, "poisoned": 1})
+
+_extractor  = ContentExtractor()
+_normalizer = Normalizer()
+
+
+def _preprocess(row):
+    path = row.get("ingestion_path", "")
+    text = _extractor.extract(row["text"], path) or row["text"]
+    return _normalizer.normalize(MemoryEntry(id="", text=text, ingestion_path=path))
+
+
+df["text"] = df.apply(_preprocess, axis=1)
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
@@ -62,3 +86,13 @@ print("-------------------------")
 print("Poison samples:", poison_total)
 print("Missed poisons:", poison_missed)
 print("ASR:", asr)
+
+print("\nPer-ingestion-path breakdown")
+print("----------------------------")
+df["pred"] = preds
+for path, g in df.groupby("ingestion_path"):
+    benign = g[g["label"] == 0]
+    poison = g[g["label"] == 1]
+    fpr = (benign["pred"] == 1).mean() if len(benign) else float("nan")
+    fnr = (poison["pred"] == 0).mean() if len(poison) else float("nan")
+    print(f"{path:20s}  n={len(g):5d}  FPR={fpr:6.1%}  FNR={fnr:6.1%}")

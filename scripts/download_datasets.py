@@ -71,6 +71,60 @@ DATASETS = [
         None,
         "Over-refusal edge cases (hard negatives) — multi-split",
     ),
+    # Real-world benign texture (train splits; test splits live in EVAL_DATASETS)
+    (
+        "ag_news_train",
+        "fancyzhx/ag_news",
+        "train",
+        "News snippets train split — benign rag/network texture",
+    ),
+    (
+        "banking77_train",
+        "mteb/banking77",
+        "train",
+        "Real user utterances train split — benign clipboard/notification texture",
+    ),
+]
+
+# Held-out evaluation datasets. NEVER used in training — the external
+# benchmark (scripts/build_external_benchmark.py) is built from these.
+EVAL_DATASETS = [
+    (
+        "eval_deepset_test",
+        "deepset/prompt-injections",
+        "test",
+        "Held-out test split of the deepset baseline (train split is in training)",
+    ),
+    (
+        "eval_safeguard_test",
+        "xTRam1/safe-guard-prompt-injection",
+        "test",
+        "Held-out test split of safe-guard (train split is in training)",
+    ),
+    (
+        "eval_gandalf",
+        "Lakera/gandalf_ignore_instructions",
+        None,
+        "Real-user 'ignore instructions' injection attempts (fully external)",
+    ),
+    (
+        "eval_sms_ham",
+        "ucirvine/sms_spam",
+        "train",
+        "Real SMS corpus — ham messages as benign notifications/SMS (fully external)",
+    ),
+    (
+        "eval_ag_news",
+        "fancyzhx/ag_news",
+        "test",
+        "News snippets — benign rag_store/network content (fully external)",
+    ),
+    (
+        "eval_banking77",
+        "mteb/banking77",
+        "test",
+        "Short real user utterances — benign clipboard/notification content (fully external)",
+    ),
 ]
 
 
@@ -113,27 +167,30 @@ def main():
     parser = argparse.ArgumentParser(description="Download external datasets for PRISM training")
     parser.add_argument("--only", nargs="+", help="Download only these datasets (by short name)")
     parser.add_argument("--list", action="store_true", help="List available datasets and exit")
+    parser.add_argument("--eval", action="store_true", help="Download held-out evaluation datasets instead")
     args = parser.parse_args()
+
+    registry = EVAL_DATASETS if args.eval else DATASETS
 
     if args.list:
         print(f"{'Name':25s} {'HuggingFace ID':50s} Description")
         print("-" * 110)
-        for name, hf_id, _, desc in DATASETS:
+        for name, hf_id, _, desc in registry:
             print(f"{name:25s} {hf_id:50s} {desc}")
         return
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {OUTPUT_DIR}\n")
 
-    targets = DATASETS
+    targets = registry
     if args.only:
-        valid = {d[0] for d in DATASETS}
+        valid = {d[0] for d in registry}
         bad = [n for n in args.only if n not in valid]
         if bad:
             print(f"Unknown dataset names: {bad}")
             print(f"Available: {sorted(valid)}")
             sys.exit(1)
-        targets = [d for d in DATASETS if d[0] in args.only]
+        targets = [d for d in registry if d[0] in args.only]
 
     ok, fail = 0, 0
     for name, hf_id, split, desc in targets:

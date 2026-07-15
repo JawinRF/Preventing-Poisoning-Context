@@ -424,7 +424,9 @@ def _memory(args: list[str]) -> None:
         print(f"{GRN}  memory saved{R}  {DIM}{doc[:80]}{R}")
         # Record lineage: new memory inherits all docs retrieved this session as parents.
         if _lineage and _lineage_session:
-            n_parents = _lineage.record_save(_lineage_session, doc_id)
+            n_parents = _lineage.record_save(
+                _lineage_session, doc_id, label=doc, task="manual /memory save"
+            )
             if n_parents:
                 print(f"  {DIM}lineage: {n_parents} parent(s) linked{R}")
 
@@ -471,88 +473,116 @@ def _memory(args: list[str]) -> None:
         print(f"{YLW}  {len(ids)} memories cleared{R}")
 
     elif sub == "lineage":
-        # /memory lineage [doc_id|flag-source <fp>]
+        # /memory lineage [doc_id | edges | events [n] | flag-source <fp>]
         if not _lineage:
             print(f"{RED}  lineage graph not available{R}"); return
 
-        # /memory lineage edges
+        def _trust_bar(t: float) -> str:
+            return f"{GRN}" if t >= 0.7 else (f"{YLW}" if t >= 0.3 else f"{RED}")
+
+        def _label_of(nid: str) -> str:
+            lbl = _lineage.get_label(nid)
+            if lbl:
+                return lbl
+            if col is not None and not nid.startswith("t3:"):
+                r = col.get(ids=[nid], include=["documents"])
+                if r.get("ids"):
+                    text = r["documents"][0]
+                    if text.startswith("[MEMORY ") and "] " in text:
+                        text = text.split("] ", 1)[1]
+                    return text
+            return ""
+
         if len(args) >= 2 and args[1] == "edges":
             rows = _lineage._conn.execute(
-                "SELECT parent_id, child_id, weight, created_at FROM edges ORDER BY created_at"
+                "SELECT parent_id, child_id, weight, edge_type, task, created_at "
+                "FROM edges ORDER BY created_at"
             ).fetchall()
             if not rows:
                 print(f"  {DIM}no edges{R}"); return
-
-            # Fetch all existing memory docs from ChromaDB for text lookup
-            all_r   = col.get(where={"source": "memory"}, include=["documents"])
-            id_to_text = {mid: doc for mid, doc in zip(
-                all_r.get("ids", []), all_r.get("documents", [])
-            )}
-
-            def _node_label(nid: str) -> str | None:
-                if nid.startswith("t3:"):
-                    return f"[T3] {nid}"
-                doc = id_to_text.get(nid)
-                if doc is None:
-                    return None  # deleted — skip
-                # strip [MEMORY yyyy-mm-dd hh:mm] prefix, show first 50 chars
-                text = doc
-                if text.startswith("[MEMORY ") and "] " in text:
-                    text = text.split("] ", 1)[1]
-                return f"{nid[:12]}  {text[:50]}"
-
-            printed = 0
             print()
-            for parent, child, weight, ts in rows:
-                plabel = _node_label(parent)
-                clabel = _node_label(child)
-                if plabel is None or clabel is None:
-                    continue  # either end deleted — skip edge
-                bar = f"{GRN}" if weight >= 0.7 else (f"{YLW}" if weight >= 0.3 else f"{RED}")
-                print(f"  {DIM}{plabel}{R}")
-                print(f"  {'':4}→ {bar}{weight:.3f}{R}  {clabel}")
+            for parent, child, weight, etype, task, ts in rows:
+                bar = _trust_bar(weight)
+                task_tag = f"  {DIM}task: {task[:45]}{R}" if task else ""
+                print(f"  {DIM}{parent[:14]:<15}{R} {_label_of(parent)[:48]}")
+                print(f"  {'':4}→ {bar}{weight:.2f}{R} [{etype}] "
+                      f"{DIM}{child[:14]}{R} {_label_of(child)[:44]}")
+                print(f"  {'':4}{DIM}{ts}{R}{task_tag}")
                 print()
-                printed += 1
-
-            if printed == 0:
-                print(f"  {DIM}no edges with existing memories{R}")
-            else:
-                print(f"  {printed} edge(s)\n")
+            print(f"  {len(rows)} edge(s)\n")
             return
 
-        # /memory lineage flag-source <fingerprint>
+        if len(args) >= 2 and args[1] == "events":
+            limit = int(args[2]) if len(args) >= 3 and args[2].isdigit() else 20
+            events = _lineage.recent_events(limit=limit)
+            if not events:
+                print(f"  {DIM}no events{R}"); return
+            print()
+            for e in events:
+                val = f" {e['value']:.2f}" if e["value"] is not None else ""
+                print(f"  {DIM}{e['ts']}{R}  {YLW}{e['kind']:<14}{R}{val}  "
+                      f"{e['subject_id'][:16]}  {DIM}{e['detail'][:60]}{R}")
+            print()
+            return
+
         if len(args) >= 2 and args[1] == "flag-source":
             if len(args) < 3:
                 print(f"{RED}  /memory lineage flag-source <t3:...fingerprint>{R}"); return
             fp  = args[2]
-            col = col   # already fetched above
             n   = _lineage.flag_t3_source(fp, 0.7, col)
             print(f"{YLW}  T3 source {fp} flagged — {n} memory/memories penalised{R}")
             return
 
         s = _lineage.stats()
         print(
-            f"\n  Lineage graph: {s['edges']} edge(s), {s['sessions']} session(s), "
+            f"\n  Lineage graph: {s['nodes']} node(s), {s['edges']} edge(s), "
+            f"{s['events']} event(s), {s['sessions']} session(s), "
             f"{s['t3_sources']} T3 source(s) ({s['t3_flagged']} flagged)"
         )
+
         if len(args) >= 2:
             target = args[1]
-            # resolve partial ID
             all_results = col.get(where={"source": "memory"}, include=["metadatas"])
             full_id = next((i for i in (all_results.get("ids") or []) if i.startswith(target)), None)
             if not full_id:
                 print(f"{RED}  no memory with id starting '{target}'{R}"); return
-            trust   = _lineage.get_trust(full_id, col)
-            parents = _lineage.get_parents(full_id)
-            children = _lineage.get_children(full_id)
-            bar = f"{GRN}" if trust >= 0.7 else (f"{YLW}" if trust >= 0.3 else f"{RED}")
-            print(f"\n  {full_id}  trust={bar}{trust:.3f}{R}")
-            print(f"  Parents  ({len(parents)}): " +
-                  (", ".join(f"{p[:12]}(w={w:.2f})" for p, w in parents) or "none"))
-            print(f"  Children ({len(children)}): " +
-                  (", ".join(f"{c[:12]}(w={w:.2f})" for c, w in children[:5]) or "none"))
+
+            d    = _lineage.describe(full_id, col)
+            node = d["node"]
+            t    = d["trust"] if d["trust"] is not None else 1.0
+            flag = f"  {RED}FLAGGED{R}" if node["flagged"] else ""
+            print(f"\n  {full_id}  trust={_trust_bar(t)}{t:.3f}{R}"
+                  f"  origin={node['origin'] or '?'}{flag}")
+            if node["label"]:
+                print(f"  {DIM}{node['label'][:90]}{R}")
+            if node["first_seen"]:
+                print(f"  {DIM}first seen {node['first_seen']}  last seen {node['last_seen']}{R}")
+
+            print(f"\n  Parents ({len(d['parents'])}):")
+            if not d["parents"]:
+                print(f"    {DIM}none — root memory{R}")
+            for p in d["parents"]:
+                pflag = f" {RED}FLAGGED{R}" if p["flagged"] else ""
+                lbl = p["label"] or _label_of(p["parent_id"])
+                print(f"    {_trust_bar(p['weight'])}{p['weight']:.2f}{R} "
+                      f"[{p['edge_type']}] {p['parent_id'][:16]}{pflag}  {DIM}{lbl[:52]}{R}")
+                if p["task"]:
+                    print(f"         {DIM}during: {p['task'][:60]}{R}")
+
+            print(f"\n  Descendants ({len(d['children'])}):")
+            if not d["children"]:
+                print(f"    {DIM}none{R}")
+            for c in d["children"][:8]:
+                lbl = c["label"] or _label_of(c["child_id"])
+                print(f"    {_trust_bar(c['cumulative_weight'])}{c['cumulative_weight']:.2f}{R} "
+                      f"{c['child_id'][:16]}  {DIM}{lbl[:56]}{R}")
+
+            if d["events"]:
+                print(f"\n  History:")
+                for e in d["events"]:
+                    val = f" {e['value']:.2f}" if e["value"] is not None else ""
+                    print(f"    {DIM}{e['ts']}{R}  {e['kind']}{val}  {DIM}{e['detail'][:55]}{R}")
         else:
-            # Show trust overview for all memories
             all_results = col.get(where={"source": "memory"}, include=["documents", "metadatas"])
             ids   = all_results.get("ids", [])
             docs  = all_results.get("documents", [])
@@ -563,14 +593,19 @@ def _memory(args: list[str]) -> None:
             print(f"  {'─'*60}")
             for mid, doc, meta in zip(ids, docs, metas or []):
                 trust  = float((meta or {}).get("trust_score", 1.0))
-                bar    = f"{GRN}" if trust >= 0.7 else (f"{YLW}" if trust >= 0.3 else f"{RED}")
                 n_ch   = len(_lineage.get_children(mid))
                 ch_tag = f" {DIM}({n_ch} child(ren)){R}" if n_ch else ""
-                print(f"  {mid:<16} {bar}{trust:.3f}{R}{ch_tag}  {DIM}{doc[:50]}{R}")
+                print(f"  {mid:<16} {_trust_bar(trust)}{trust:.3f}{R}{ch_tag}  {DIM}{doc[:50]}{R}")
+            events = _lineage.recent_events(limit=6)
+            if events:
+                print(f"\n  Recent activity:")
+                for e in events:
+                    val = f" {e['value']:.2f}" if e["value"] is not None else ""
+                    print(f"    {DIM}{e['ts']}{R}  {e['kind']}{val}  {DIM}{e['detail'][:55]}{R}")
         print()
 
     else:
-        print(f"{RED}  /memory list | view <id> | save <text> | del <index> | clear | lineage [id]{R}")
+        print(f"{RED}  /memory list | view <id> | save <text> | del <index> | clear | lineage [id|edges|events]{R}")
 
 
 # ── Chat with Claude ────────────────────────────────────────────────────────

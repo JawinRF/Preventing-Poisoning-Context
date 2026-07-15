@@ -64,7 +64,7 @@ class DeBERTaValidator:
         if _letter_word_count(normalized_text) < self._MIN_LETTER_WORDS:
             return ValidationResult(
                 verdict="ALLOW",
-                confidence=0.99,
+                confidence=0.01,
                 reason="Layer 3 DeBERTa skipped: insufficient natural-language context",
                 layer_triggered="Layer3-DeBERTa",
             )

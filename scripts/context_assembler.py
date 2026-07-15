@@ -1118,7 +1118,10 @@ class ContextAssembler:
             # Record which sealed docs were retrieved this session — so any
             # memory the user saves later inherits these as parents.
             if lineage and session_id and sealed_ids:
-                lineage.record_retrieval(session_id, sealed_ids)
+                lineage.record_retrieval(
+                    session_id, sealed_ids,
+                    labels=dict(zip(sealed_ids, sealed_docs)),
+                )
 
             # ── Layer 2: MemShield retrieval defense (influence + ragmask + authority + scorer)
             # Routes sealed docs through the full cross-doc scoring pipeline.
