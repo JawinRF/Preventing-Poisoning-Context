@@ -36,8 +36,13 @@ Thumbs.db
 *.key
 view.xml
 
-# Data and models (large / runtime-generated, rebuilt via scripts)
-data/
+# Data and models. The labelled datasets backing the reported benchmark
+# numbers are tracked; runtime state and the raw external corpora
+# (432MB, re-downloadable via scripts/download_datasets.py) are not.
+data/*
+!data/prism_synthetic_dataset.json
+!data/prism_external_benchmark.json
+!data/prism_training_dataset.json
 models/
 memshield/data/
 
@@ -57,3 +62,4 @@ openclaw-android/
 
 # Secrets
 anthropic/
+/openclaw/

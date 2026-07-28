@@ -318,8 +318,12 @@ memshield/
     scorer.py       # Composite poison scorer
     provenance.py   # SHA-256 chunk provenance
 
-data/
+data/                             # tracked datasets; everything else is runtime state
   prism_synthetic_dataset.json    # 1,498-entry evaluation set (7 ingestion paths)
+  prism_external_benchmark.json   # 2,810-entry held-out generalization set
+  prism_training_dataset.json     # 55,019-entry TinyBERT v3 training set
+  external/                       # raw corpora, NOT tracked (432MB)
+                                  # restore with scripts/download_datasets.py --eval
 
 models/
   tinybert_poison_classifier_v3/  # TinyBERT v3 FP32 weights
