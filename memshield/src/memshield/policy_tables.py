@@ -89,6 +89,7 @@ _ACTION_TO_KIND: dict[str, str] = {
     "send_email":     "send_message",
     "share":          "send_message",
     "post":           "network_request",
+    "external_consent": "network_request",
     "open_url":       "open_url",
 
     # File system
@@ -99,6 +100,7 @@ _ACTION_TO_KIND: dict[str, str] = {
     "install_app":    "install_app",
     "uninstall_app":  "install_app",
     "system_setting": "system_setting",
+    "grant_permission": "system_setting",
     "payment":        "payment",
 }
 

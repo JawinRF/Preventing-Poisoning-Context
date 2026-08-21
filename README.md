@@ -150,9 +150,15 @@ Deterministic checks run on the Android side before every tap:
 
 - Foreground package verification (are we tapping what we think we're tapping?)
 - Overlay and obscuration detection
-- Target node validation
+- Exact target validation: resolved tap coordinates are bound to the node that
+  will actually receive the tap, so duplicate labels cannot validate the wrong node
 - Bounds and interactability checks
 - Dual-snapshot stability (element didn't move between check and tap)
+
+Unlabelled icon/FAB taps are checked by coordinate, while text, description,
+and resource-id remain selector fallbacks. Generic commit controls such as
+`Allow`, `Accept`, and payment/installation confirmations are never taken by
+the no-LLM fast path; PROVE elevates them to the appropriate R2/R3 policy.
 
 If `:8766` is unreachable, tap integrity fails open with a warning logged — availability is preserved at the cost of the integrity check.
 
@@ -184,8 +190,8 @@ Each agent step:
 
 1. `context_assembler.py` dumps the UI hierarchy via uiautomator2 and parses every node into `{idx, xy, rid, class, text?, desc?, input_field?}`. Clickable icon buttons without labels are retained.
 2. A screenshot is captured and overlaid with numbered circles at each element's `xy` (Set-of-Mark prompting). Red = clickable, blue = text input.
-3. The LLM reads the element list and annotated screenshot and replies with a structured action like `{"action":"tap","params":{"idx":3}}`. `agent_prism.py` resolves `idx → xy` from the element list before calling `DefendedDevice.execute` — the LLM cannot hallucinate coordinates.
-4. `defended_device.py` runs PRISM + UI-integrity checks, then executes via `adb shell input tap` (for `xy`) or uiautomator2 selectors (for `rid`, `text`, `desc`).
+3. The LLM reads the element list and annotated screenshot and replies with a structured action like `{"action":"tap","params":{"idx":3}}`. The action and parameter shape are validated before use, and `agent_prism.py` resolves `idx → xy` from the current element list — the LLM cannot extend the action API or hallucinate coordinates.
+4. PROVE classifies the effect of commit-like controls (send, permission, install, payment, consent) before `defended_device.py` binds the exact target to Android's current accessibility tree and executes it via `adb shell input tap` or a uiautomator2 selector.
 
 Loop and stuck detection escalates to `press back` then `press home` after several consecutive no-progress steps.
 

@@ -593,21 +593,39 @@ def _prove_supporting_chunks(action: str, params: dict, ctx) -> list:
 
 
 _CONSEQUENTIAL_TAP_RULES = (
-    (re.compile(r"\b(send|submit|reply)\b", re.I), "send_sms"),
-    (re.compile(r"\b(share|post|forward)\b", re.I), "share"),
+    # Order matters: "send money" is a payment, not merely a message send.
+    (re.compile(
+        r"\b(pay|payment|buy now|purchase|checkout|place order|confirm payment|"
+        r"send money|transfer money|donate|start trial|subscribe)\b", re.I,
+    ), "payment"),
     (re.compile(r"\b(install|uninstall)\b", re.I), "install_app"),
-    (re.compile(r"\b(pay|buy now|purchase|checkout|place order|confirm payment)\b", re.I), "payment"),
-    (re.compile(r"\b(factory reset|erase all data|reset phone)\b", re.I), "system_setting"),
+    (re.compile(
+        r"\b(factory reset|erase all data|reset phone|delete account|"
+        r"remove account|wipe device|format storage)\b", re.I,
+    ), "system_setting"),
+    (re.compile(
+        r"\b(allow|grant permission|while using (?:the )?app|only this time|"
+        r"precise location|camera access|microphone access)\b", re.I,
+    ), "grant_permission"),
+    (re.compile(r"\b(send|submit|reply|publish)\b", re.I), "send_sms"),
+    (re.compile(r"\b(share|post|forward)\b", re.I), "share"),
+    (re.compile(r"\b(accept|agree|consent)\b", re.I), "external_consent"),
+)
+
+_GENERIC_COMMIT_LABEL = re.compile(
+    r"^(confirm|continue|yes|ok|okay|done|approve)$", re.I,
 )
 
 
-def _prove_gate_action(action: str, params: dict) -> str:
+def _prove_gate_action(action: str, params: dict, ctx=None) -> str:
     """Map the raw agent verb to the verb the policy gate should judge.
 
     The agent's vocabulary is generic UI motion (tap/type/press); the
     consequential effect of a tap depends on what it lands on. A tap on a
-    Send/Install/Pay/Reset control is the enforcement point for the
-    corresponding R2/R3 policy, so elevate it before the gate lookup.
+    Send/Install/Pay/Permission control is the enforcement point for the
+    corresponding R2/R3 policy, so elevate it before the gate lookup. Generic
+    commit labels such as "Confirm" are classified using the rest of the
+    visible screen; the label alone does not reveal the effect being approved.
     """
     if action not in ("tap", "web_tap"):
         return action
@@ -620,6 +638,19 @@ def _prove_gate_action(action: str, params: dict) -> str:
     for pattern, verb in _CONSEQUENTIAL_TAP_RULES:
         if pattern.search(label):
             return verb
+
+    if _GENERIC_COMMIT_LABEL.fullmatch(label.strip()) and ctx is not None:
+        screen_parts = []
+        for element in getattr(ctx, "ui_elements", []) or []:
+            screen_parts.extend(
+                str(element.get(key, ""))
+                for key in ("text", "desc", "rid")
+                if element.get(key)
+            )
+        screen_text = re.sub(r"[_\-./:]", " ", " ".join(screen_parts))
+        for pattern, verb in _CONSEQUENTIAL_TAP_RULES:
+            if pattern.search(screen_text):
+                return verb
     return action
 
 
@@ -662,13 +693,18 @@ def _prove_check_action(
     if not _PROVE_AVAILABLE or PROVE_MODE == "off":
         return True, {}
 
-    gate_action = _prove_gate_action(action, params)
+    gate_action = _prove_gate_action(action, params, ctx)
     fact_key, fact_value = _prove_fact_value(action, params)
 
     # User-typed waiver: treat the task string as T0_USER_TYPED. If the
     # contested fact_value appears verbatim in the task, the gate allows.
     user_typed_value = None
-    if isinstance(fact_value, str) and fact_value \
+    # A generic UI label ("Send", "Pay", "Allow") describes the effect, not
+    # its recipient/amount/permission. Never let a coincidental label match in
+    # the task become a T0 waiver for an elevated tap; ask the user at the
+    # actual side-effect boundary instead.
+    elevated_ui_action = action in ("tap", "web_tap") and gate_action != action
+    if not elevated_ui_action and isinstance(fact_value, str) and fact_value \
             and fact_value.lower() in task.lower():
         user_typed_value = fact_value
 
@@ -1067,23 +1103,101 @@ def ask_local(prompt_dict: dict) -> dict:
         return _fail(str(e))
 
 
+_AGENT_ACTIONS = frozenset({
+    "open_app", "tap", "type", "clear", "swipe", "press",
+    "web_tap", "web_type", "done", "fail",
+})
+_TAP_SELECTORS = ("idx", "xy", "rid", "text", "desc", "class")
+
+
+def _validate_decision(value: object) -> dict:
+    """Validate the planner's JSON at the action boundary.
+
+    The model is allowed to choose an action, not to extend the action API.
+    Reject malformed shapes and unknown verbs early so the retry path can
+    correct them before progress tracking, PROVE, or device code sees them.
+    """
+    if not isinstance(value, dict):
+        return _fail("invalid json: expected an object")
+
+    action = value.get("action")
+    if not isinstance(action, str) or action not in _AGENT_ACTIONS:
+        return _fail(f"invalid action: {action!r}")
+
+    params = value.get("params", {})
+    if not isinstance(params, dict):
+        return _fail("invalid params: expected an object")
+
+    def _present(key: str) -> bool:
+        return key in params and params[key] not in (None, "")
+
+    if action == "open_app":
+        package = params.get("package")
+        if not isinstance(package, str) or not re.fullmatch(r"[A-Za-z0-9_.]+", package):
+            return _fail("invalid open_app package")
+    elif action == "tap":
+        if not any(_present(key) for key in _TAP_SELECTORS):
+            return _fail("invalid tap: missing target selector")
+        for key in ("rid", "text", "desc", "class"):
+            if key in params and not isinstance(params[key], str):
+                return _fail(f"invalid tap {key}: expected a string")
+        if "idx" in params:
+            try:
+                if int(params["idx"]) < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return _fail("invalid tap idx")
+        if "xy" in params:
+            xy = params["xy"]
+            if not isinstance(xy, (list, tuple)) or len(xy) != 2 \
+                    or not all(isinstance(v, (int, float)) for v in xy):
+                return _fail("invalid tap xy")
+    elif action in ("type", "web_type"):
+        if not isinstance(params.get("text"), str):
+            return _fail(f"invalid {action}: text must be a string")
+        if action == "web_type" and "selector" in params \
+                and not isinstance(params["selector"], str):
+            return _fail("invalid web_type selector: expected a string")
+    elif action == "web_tap":
+        if not (_present("text") or _present("selector")):
+            return _fail("invalid web_tap: missing text or selector")
+        for key in ("text", "selector"):
+            if key in params and not isinstance(params[key], str):
+                return _fail(f"invalid web_tap {key}: expected a string")
+    elif action == "swipe":
+        if params.get("direction") not in ("up", "down", "left", "right"):
+            return _fail("invalid swipe direction")
+    elif action == "press":
+        if params.get("key") not in ("back", "home", "enter"):
+            return _fail("invalid press key")
+    elif action == "done" and not isinstance(params.get("summary", ""), str):
+        return _fail("invalid done summary")
+    elif action == "fail" and not isinstance(params.get("reason", ""), str):
+        return _fail("invalid fail reason")
+
+    thought = value.get("thought", "")
+    if not isinstance(thought, str):
+        thought = str(thought)
+    return {"thought": thought, "action": action, "params": params}
+
+
 def _parse_json(raw: str) -> dict:
-    """Extract first valid JSON object from LLM response."""
+    """Extract and validate the first JSON action object in an LLM response.
+
+    JSONDecoder understands braces inside quoted strings; the old manual brace
+    counter did not and rejected otherwise valid typing actions such as text
+    containing ``{name}``.
+    """
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-    depth, start = 0, None
-    for i, ch in enumerate(raw):
-        if ch == "{":
-            if start is None:
-                start = i
-            depth += 1
-        elif ch == "}" and depth > 0:
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(raw[start:i+1])
-                except Exception:
-                    start = None
+
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", raw):
+        try:
+            value, _ = decoder.raw_decode(raw, match.start())
+        except json.JSONDecodeError:
+            continue
+        return _validate_decision(value)
     return _fail("invalid json")
 
 
@@ -1175,25 +1289,24 @@ def ask_reflection(
 
 
 # ── Obvious-Action Fast Path ─────────────────────────────────────────────────
-# Ported from the reference OpenClaw agent: auto-tap obvious UI buttons
-# (OK, Done, Confirm, …) without burning an LLM call.  Dramatically reduces
-# latency on dialog/confirmation screens.
+# Auto-dismiss only a non-committing informational acknowledgement without
+# burning an LLM call. Controls that can commit state are deliberately excluded.
 
 
-_OBVIOUS_BUTTONS = ("Got it", "Accept", "Allow", "Confirm")
-# "OK" and "Done" are intentionally excluded — they appear in pickers, forms,
-# and save dialogs where the LLM must fill values first. Only truly context-free
-# single-purpose confirmations qualify.
+_SAFE_OBVIOUS_BUTTONS = frozenset({"got it"})
+# Commit-like labels (Allow, Accept, Confirm, OK, Done, Continue) are
+# intentionally excluded. They can grant permissions, accept terms, submit a
+# form, or authorize a transaction; those must go through planning + PROVE.
 
 def check_obvious_actions(task: str, screen: list[dict], screen_changed: bool) -> dict | None:
-    """Return an action dict if the screen is a simple confirmation dialog, else None.
+    """Return an action for a non-committing acknowledgement, else None.
 
     Conservative: only fires when:
       1. No input fields present (not a form).
       2. Screen is small (≤10 elements) — real confirmation dialogs; pickers/
          calendars/forms have 15-30+ elements.
-      3. Button text is in the context-free set (not OK/Done which appear in
-         pickers and save dialogs).
+      3. The button is the informational acknowledgement "Got it". Generic
+         confirmation/permission labels always go through the LLM and gate.
     """
     if any(e.get("input_field") for e in screen):
         return None
@@ -1203,7 +1316,9 @@ def check_obvious_actions(task: str, screen: list[dict], screen_changed: bool) -
         return None
 
     for elem in screen:
-        if elem.get("text") in _OBVIOUS_BUTTONS and "Button" in elem.get("class", ""):
+        text = str(elem.get("text", "")).strip()
+        if text.casefold() in _SAFE_OBVIOUS_BUTTONS \
+                and "Button" in elem.get("class", ""):
             logger.info(f"Obvious button: {elem['text']} — auto-tapping")
             return {"thought": "obvious button", "action": "tap",
                     "params": {"text": elem["text"]}}
@@ -1842,6 +1957,10 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
                         params["text"] = match["text"]
                     elif match.get("desc"):
                         params["desc"] = match["desc"]
+                    if match.get("rid"):
+                        params["rid"] = match["rid"]
+                    if match.get("class"):
+                        params["class"] = match["class"]
                 else:
                     print(f"  {YELLOW}idx {idx} has no xy in element list{RESET}")
             except (ValueError, TypeError):

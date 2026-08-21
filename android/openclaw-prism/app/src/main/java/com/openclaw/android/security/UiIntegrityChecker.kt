@@ -14,7 +14,7 @@ import org.json.JSONObject
  * Replaces VLM-based visual grounding with OS-level signals:
  *   - Foreground package/activity verification
  *   - Overlay / obscuration window detection
- *   - Target node existence, bounds, enabled/clickable state
+ *   - Exact coordinate/selector target existence, bounds, enabled/clickable state
  *   - Dual-snapshot stability (same node in two rapid tree captures)
  *
  * Design rationale (research-backed):
@@ -43,12 +43,20 @@ class UiIntegrityChecker(private val service: AccessibilityService) {
      *
      * @param targetText  text attribute of the element to verify (nullable)
      * @param targetDesc  content-description of the element to verify (nullable)
+     * @param targetRid   resource-id of the element to verify (nullable)
+     * @param targetClass accessibility class of the element to verify (nullable)
+     * @param targetX     exact planned tap x-coordinate (nullable)
+     * @param targetY     exact planned tap y-coordinate (nullable)
      * @param expectedPkg expected foreground package (nullable — skips check if null)
      * @return JSON object with verdict and details
      */
     fun check(
         targetText: String?,
         targetDesc: String?,
+        targetRid: String?,
+        targetClass: String?,
+        targetX: Int?,
+        targetY: Int?,
         expectedPkg: String?,
     ): JSONObject {
         val result = JSONObject()
@@ -83,8 +91,15 @@ class UiIntegrityChecker(private val service: AccessibilityService) {
         if (hasOverlay) blocked = true
 
         // ── 3. Target node lookup ───────────────────────────────────────────
-        if (targetText != null || targetDesc != null) {
-            val node1 = findTargetNode(targetText, targetDesc)
+        if (targetX != null && targetY != null) {
+            result.put("target_coordinates", JSONArray().put(targetX).put(targetY))
+        }
+        val hasTarget = targetText != null || targetDesc != null || targetRid != null ||
+                targetClass != null || (targetX != null && targetY != null)
+        if (hasTarget) {
+            val node1 = findTargetNode(
+                targetText, targetDesc, targetRid, targetClass, targetX, targetY,
+            )
             if (node1 == null) {
                 checks.put(JSONObject().apply {
                     put("check", "node_exists")
@@ -104,6 +119,21 @@ class UiIntegrityChecker(private val service: AccessibilityService) {
                     put("pass", true)
                     put("node", nodeInfo)
                 })
+
+                if (targetX != null && targetY != null) {
+                    val identityMatch = matchesExpectedTarget(
+                        nodeInfo, targetText, targetDesc, targetRid, targetClass,
+                    )
+                    checks.put(JSONObject().apply {
+                        put("check", "planned_target_identity")
+                        put("pass", identityMatch)
+                        put("expected_text", targetText ?: "")
+                        put("expected_desc", targetDesc ?: "")
+                        put("expected_resource_id", targetRid ?: "")
+                        put("expected_class", targetClass ?: "")
+                    })
+                    if (!identityMatch) blocked = true
+                }
 
                 // Bounds sanity
                 checks.put(JSONObject().apply {
@@ -126,7 +156,9 @@ class UiIntegrityChecker(private val service: AccessibilityService) {
                 // ── 4. Dual-snapshot stability ──────────────────────────────
                 node1.recycle()
                 Thread.sleep(STABILITY_DELAY_MS)
-                val node2 = findTargetNode(targetText, targetDesc)
+                val node2 = findTargetNode(
+                    targetText, targetDesc, targetRid, targetClass, targetX, targetY,
+                )
                 if (node2 == null) {
                     checks.put(JSONObject().apply {
                         put("check", "stability")
@@ -140,10 +172,14 @@ class UiIntegrityChecker(private val service: AccessibilityService) {
                     val bounds2 = info2.optJSONArray("bounds")
                     node2.recycle()
 
-                    val stable = areBoundsStable(bounds1, bounds2)
+                    val identityStable = matchesExpectedTarget(
+                        info2, targetText, targetDesc, targetRid, targetClass,
+                    )
+                    val stable = areBoundsStable(bounds1, bounds2) && identityStable
                     checks.put(JSONObject().apply {
                         put("check", "stability")
                         put("pass", stable)
+                        put("identity_stable", identityStable)
                         put("bounds_snapshot_1", bounds1)
                         put("bounds_snapshot_2", bounds2)
                     })
@@ -234,18 +270,51 @@ class UiIntegrityChecker(private val service: AccessibilityService) {
 
     // ── Node lookup ─────────────────────────────────────────────────────────
 
-    private fun findTargetNode(text: String?, desc: String?): AccessibilityNodeInfo? {
+    private fun findTargetNode(
+        text: String?,
+        desc: String?,
+        rid: String?,
+        targetClass: String?,
+        x: Int?,
+        y: Int?,
+    ): AccessibilityNodeInfo? {
         val root = try {
             service.rootInActiveWindow
         } catch (_: Exception) { null } ?: return null
 
-        val found = findNodeRecursive(root, text, desc, depth = 0)
-        if (found == null || found == root) {
-            // Don't recycle root if it IS the found node
-            if (found == null) root.recycle()
+        // Coordinates are authoritative when present: this verifies the node
+        // that will actually receive the tap rather than the first duplicate
+        // label elsewhere in the tree. Selectors remain the fallback for
+        // uiautomator text/resource-id taps that have no resolved coordinates.
+        val found = if (x != null && y != null) {
+            val hasIdentity = text != null || desc != null || rid != null || targetClass != null
+            val plannedNode = if (hasIdentity) {
+                findMatchingNodeAtPoint(
+                    root, x, y, text, desc, rid, targetClass, depth = 0,
+                )
+            } else {
+                null
+            }
+            plannedNode ?: findNodeAtPoint(root, x, y, depth = 0)
         } else {
-            root.recycle()
+            // Mirror DefendedDevice's selector precedence exactly so the node
+            // we validate is the node uiautomator will click.
+            when {
+                rid != null -> findNodeRecursive(
+                    root, null, null, rid, null, depth = 0,
+                )
+                text != null -> findNodeRecursive(
+                    root, text, null, null, null, depth = 0,
+                )
+                desc != null -> findNodeRecursive(
+                    root, null, desc, null, null, depth = 0,
+                )
+                else -> findNodeRecursive(
+                    root, null, null, null, targetClass, depth = 0,
+                )
+            }
         }
+        root.recycle()
         return found
     }
 
@@ -253,28 +322,150 @@ class UiIntegrityChecker(private val service: AccessibilityService) {
         node: AccessibilityNodeInfo,
         text: String?,
         desc: String?,
+        rid: String?,
+        targetClass: String?,
         depth: Int,
     ): AccessibilityNodeInfo? {
         if (depth > MAX_TREE_DEPTH) return null
 
         val nodeText = node.text?.toString()?.trim() ?: ""
         val nodeDesc = node.contentDescription?.toString()?.trim() ?: ""
+        val nodeRid = node.viewIdResourceName ?: ""
+        val nodeClass = node.className?.toString() ?: ""
 
-        // Exact match on text or content-description
+        // Exact match on text/content-description, or full/suffix resource-id.
         if (text != null && nodeText.equals(text, ignoreCase = true)) {
             return AccessibilityNodeInfo.obtain(node)
         }
         if (desc != null && nodeDesc.equals(desc, ignoreCase = true)) {
             return AccessibilityNodeInfo.obtain(node)
         }
+        if (rid != null && (
+                    nodeRid.equals(rid, ignoreCase = true) ||
+                    nodeRid.substringAfterLast('/').equals(
+                        rid.substringAfterLast('/'), ignoreCase = true,
+                    )
+                )) {
+            return AccessibilityNodeInfo.obtain(node)
+        }
+        if (targetClass != null && (
+                    nodeClass.equals(targetClass, ignoreCase = true) ||
+                    nodeClass.substringAfterLast('.').equals(
+                        targetClass.substringAfterLast('.'), ignoreCase = true,
+                    )
+                )) {
+            return AccessibilityNodeInfo.obtain(node)
+        }
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            val found = findNodeRecursive(child, text, desc, depth + 1)
+            val found = findNodeRecursive(
+                child, text, desc, rid, targetClass, depth + 1,
+            )
             child.recycle()
             if (found != null) return found
         }
         return null
+    }
+
+    private fun findMatchingNodeAtPoint(
+        node: AccessibilityNodeInfo,
+        x: Int,
+        y: Int,
+        text: String?,
+        desc: String?,
+        rid: String?,
+        targetClass: String?,
+        depth: Int,
+    ): AccessibilityNodeInfo? {
+        if (depth > MAX_TREE_DEPTH) return null
+
+        val bounds = Rect()
+        node.getBoundsInScreen(bounds)
+        if (!bounds.contains(x, y)) return null
+
+        if (matchesExpectedTarget(describeNode(node), text, desc, rid, targetClass)) {
+            return AccessibilityNodeInfo.obtain(node)
+        }
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            val found = findMatchingNodeAtPoint(
+                child, x, y, text, desc, rid, targetClass, depth + 1,
+            )
+            child.recycle()
+            if (found != null) return found
+        }
+        return null
+    }
+
+    private fun findNodeAtPoint(
+        node: AccessibilityNodeInfo,
+        x: Int,
+        y: Int,
+        depth: Int,
+    ): AccessibilityNodeInfo? {
+        if (depth > MAX_TREE_DEPTH) return null
+
+        val bounds = Rect()
+        node.getBoundsInScreen(bounds)
+        if (!bounds.contains(x, y)) return null
+
+        // Prefer the deepest meaningful node containing the planned point.
+        // If a label/image child is not independently interactable, its
+        // clickable parent remains available as the fallback candidate.
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            val found = findNodeAtPoint(child, x, y, depth + 1)
+            child.recycle()
+            if (found != null) return found
+        }
+
+        val meaningful = node.isClickable || node.isFocusable ||
+                !node.text.isNullOrBlank() || !node.contentDescription.isNullOrBlank() ||
+                !node.viewIdResourceName.isNullOrBlank()
+        return if (depth > 0 && node.isEnabled && node.isVisibleToUser && meaningful) {
+            AccessibilityNodeInfo.obtain(node)
+        } else {
+            null
+        }
+    }
+
+    private fun matchesExpectedTarget(
+        nodeInfo: JSONObject,
+        text: String?,
+        desc: String?,
+        rid: String?,
+        targetClass: String?,
+    ): Boolean {
+        if (text != null && !nodeInfo.optString("text").equals(text, ignoreCase = true)) {
+            return false
+        }
+        if (desc != null &&
+            !nodeInfo.optString("content_desc").equals(desc, ignoreCase = true)
+        ) {
+            return false
+        }
+        if (rid != null) {
+            val actualRid = nodeInfo.optString("resource_id")
+            if (!actualRid.equals(rid, ignoreCase = true) &&
+                !actualRid.substringAfterLast('/').equals(
+                    rid.substringAfterLast('/'), ignoreCase = true,
+                )
+            ) {
+                return false
+            }
+        }
+        if (targetClass != null) {
+            val actualClass = nodeInfo.optString("class_name")
+            if (!actualClass.equals(targetClass, ignoreCase = true) &&
+                !actualClass.substringAfterLast('.').equals(
+                    targetClass.substringAfterLast('.'), ignoreCase = true,
+                )
+            ) {
+                return false
+            }
+        }
+        return true
     }
 
     // ── Node description ────────────────────────────────────────────────────

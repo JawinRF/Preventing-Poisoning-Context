@@ -286,9 +286,21 @@ class OpenClawService : Service() {
         val json = JSONObject(body)
         val targetText = json.optString("target_text").ifEmpty { null }
         val targetDesc = json.optString("target_desc").ifEmpty { null }
+        val targetRid = json.optString("target_rid").ifEmpty { null }
+        val targetClass = json.optString("target_class").ifEmpty { null }
+        val targetX = if (json.has("target_x")) json.optInt("target_x") else null
+        val targetY = if (json.has("target_y")) json.optInt("target_y") else null
         val expectedPkg = json.optString("expected_package").ifEmpty { null }
 
-        return a11y.uiIntegrity.check(targetText, targetDesc, expectedPkg).toString()
+        return a11y.uiIntegrity.check(
+            targetText = targetText,
+            targetDesc = targetDesc,
+            targetRid = targetRid,
+            targetClass = targetClass,
+            targetX = targetX,
+            targetY = targetY,
+            expectedPkg = expectedPkg,
+        ).toString()
     }
 
     // GET /v1/context — Unified device context for the Python agent.

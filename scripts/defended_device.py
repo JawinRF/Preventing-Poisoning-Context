@@ -305,6 +305,9 @@ class DefendedDevice:
         self,
         target_text: str | None = None,
         target_desc: str | None = None,
+        target_rid: str | None = None,
+        target_class: str | None = None,
+        target_xy: list[int] | tuple[int, int] | None = None,
         expected_package: str | None = None,
     ) -> bool:
         """Verify tap target via deterministic OS-level checks on the Android sidecar.
@@ -312,9 +315,11 @@ class DefendedDevice:
         Checks (all fast, <100ms total):
           1. Foreground package matches expected target
           2. No suspicious overlay / obscuration windows
-          3. Target node exists in accessibility tree with valid bounds
-          4. Node is enabled and visible
-          5. Node is stable across two rapid accessibility snapshots
+          3. The node at the exact tap coordinates (or selector fallback)
+             exists in the accessibility tree with valid bounds
+          4. The node identity matches the element seen during planning
+          5. Node is enabled and visible
+          6. Node is stable across two rapid accessibility snapshots
 
         Returns True if all checks pass or sidecar unavailable, False if blocked.
         """
@@ -323,6 +328,16 @@ class DefendedDevice:
             payload["target_text"] = target_text
         if target_desc:
             payload["target_desc"] = target_desc
+        if target_rid:
+            payload["target_rid"] = target_rid
+        if target_class:
+            payload["target_class"] = target_class
+        if isinstance(target_xy, (list, tuple)) and len(target_xy) == 2:
+            try:
+                payload["target_x"] = int(target_xy[0])
+                payload["target_y"] = int(target_xy[1])
+            except (TypeError, ValueError):
+                pass
         if expected_package:
             payload["expected_package"] = expected_package
 
@@ -344,19 +359,28 @@ class DefendedDevice:
         verdict = result.get("verdict", "ALLOW")
         checks = result.get("checks", [])
 
+        if result.get("reason") == "accessibility_service_unavailable":
+            logger.warning(
+                "UI integrity sidecar is running but its accessibility service "
+                "is unavailable — allowing tap without target validation"
+            )
+            return True
+
         if verdict == "BLOCK":
             failed = [c for c in checks if not c.get("pass", True)]
             reasons = ", ".join(c.get("check", "?") for c in failed)
+            target = target_text or target_desc or target_rid or target_class or target_xy
             logger.warning(
-                f"UI INTEGRITY BLOCKED tap on '{target_text or target_desc}': "
+                f"UI INTEGRITY BLOCKED tap on '{target}': "
                 f"failed checks: [{reasons}]"
             )
             for c in failed:
                 logger.debug(f"  check={c.get('check')}: {json.dumps(c)}")
             return False
 
+        target = target_text or target_desc or target_rid or target_class or target_xy
         logger.debug(
-            f"UI integrity passed for '{target_text or target_desc}' "
+            f"UI integrity passed for '{target}' "
             f"({len(checks)} checks, pkg={result.get('foreground_package', '?')})"
         )
         return True
@@ -449,16 +473,27 @@ class DefendedDevice:
             if action == "tap":
                 target_text = params.get("text")
                 target_desc = params.get("desc")
+                target_rid = params.get("rid")
+                target_class = params.get("class")
+                target_xy = params.get("xy")
 
-                # OS-level UI integrity check (deterministic, <100ms)
-                if target_text or target_desc:
-                    # Snapshot foreground package so sidecar can verify it hasn't changed
-                    try:
-                        expected_pkg = self._d.app_current().get("package")
-                    except Exception:
-                        expected_pkg = None
-                    if not self._verify_ui_integrity(target_text, target_desc, expected_pkg):
-                        return "blocked_by_ui_integrity"
+                # OS-level UI integrity check (deterministic, <100ms). Run for
+                # every tap, including unlabeled icon/FAB taps resolved to xy.
+                # Snapshot foreground package so the sidecar can verify it did
+                # not change between planning and execution.
+                try:
+                    expected_pkg = self._d.app_current().get("package")
+                except Exception:
+                    expected_pkg = None
+                if not self._verify_ui_integrity(
+                    target_text=target_text,
+                    target_desc=target_desc,
+                    target_rid=target_rid,
+                    target_class=target_class,
+                    target_xy=target_xy,
+                    expected_package=expected_pkg,
+                ):
+                    return "blocked_by_ui_integrity"
 
                 if "xy" in params:
                     xy = params["xy"]
