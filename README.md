@@ -26,7 +26,11 @@ Android emulator / device
   └─ security_warning (annotated UI elements)
                  │
                  ▼
-        LLM agent (Claude / Groq / local)
+        AgentController + LLM
+  ├─ trusted-input plan + bounded replans
+  ├─ action/result/observation verification
+  ├─ evidence-gated step and completion state
+  └─ append-only per-run event journal
                  │
                  ▼
         DefendedDevice
@@ -186,14 +190,17 @@ MemShield wraps ChromaDB and defends the retrieval-augmented memory store agains
 
 ## Agent observation and action
 
-Each agent step:
+The runtime is an explicit plan → act → verify → recover loop:
 
-1. `context_assembler.py` dumps the UI hierarchy via uiautomator2 and parses every node into `{idx, xy, rid, class, text?, desc?, input_field?}`. Clickable icon buttons without labels are retained.
-2. A screenshot is captured and overlaid with numbered circles at each element's `xy` (Set-of-Mark prompting). Red = clickable, blue = text input.
-3. The LLM reads the element list and annotated screenshot and replies with a structured action like `{"action":"tap","params":{"idx":3}}`. The action and parameter shape are validated before use, and `agent_prism.py` resolves `idx → xy` from the current element list — the LLM cannot extend the action API or hallucinate coordinates.
-4. PROVE classifies the effect of commit-like controls (send, permission, install, payment, consent) before `defended_device.py` binds the exact target to Android's current accessibility tree and executes it via `adb shell input tap` or a uiautomator2 selector.
+1. `agent_controller.py` creates a bounded task plan in an isolated call that receives only the trusted task, installed-app facts, and a vetted skill procedure. Raw UI/device text is deliberately excluded from this privileged control-flow call.
+2. `context_assembler.py` dumps the UI hierarchy via uiautomator2 and parses every node into `{idx, xy, rid, class, text?, desc?, input_field?}`. Clickable icon buttons without labels are retained, and a screenshot receives numbered Set-of-Mark bubbles.
+3. Before asking for another action, the controller correlates the previous executor result with the new screen signature, foreground package, and literal UI evidence. An `ok` result without an observable effect is recorded as `no_progress`, not success.
+4. The acting LLM receives the host-owned plan, active step, verified outcome, remaining budgets, recovery directive, and exact failed actions it must not repeat. Its structured action is schema-checked, then `idx → xy` is resolved from the current element list.
+5. PROVE classifies commit-like effects (send, permission, install, payment, consent) before `defended_device.py` binds the exact target to Android's current accessibility tree and executes it.
+6. Repeated failures or loop patterns request a bounded replan. They no longer trigger an immediate guessed `back`/`home` action. Exact failed retries are rejected before they reach PROVE or the device.
+7. `done` is only a proposal. A separate zero-tool verifier must account for every success criterion and cite evidence that the host can ground in the current UI/package or a verified action attempt.
 
-Loop and stuck detection escalates to `press back` then `press home` after several consecutive no-progress steps.
+Every lifecycle transition is appended to `data/agent_runs/<run-id>.jsonl`; the older compact trajectory log remains available for aggregate analysis. Runtime logs are ignored by Git.
 
 ---
 

@@ -342,7 +342,46 @@ wants to tap at (500, 1200) and no element exists there, the action does not
 type-check. Every action is grounded in something the device actually
 returned.
 
-### 6.2 Loop and stuck detection
+### 6.2 Host-owned plan, verification, and recovery
+
+`agent_controller.py` is a deterministic control plane around the LLM/device
+loop. The model proposes content; the host owns state transitions.
+
+At the first defended observation, an isolated planner produces a bounded list
+of subgoals and literal success evidence. This call receives only the trusted
+task, installed-package facts, and an already-vetted skill procedure. Raw UI,
+notifications, clipboard, SMS, web text, and screenshots are intentionally
+absent: untrusted data cannot author privileged control flow. If the planner is
+unavailable or its JSON is invalid, a conservative single-step plan keeps the
+run executable.
+
+Each admitted device action becomes an attempt with a stable id and a pre-action
+observation. On the next iteration, the controller joins four facts:
+
+- the executor result (`ok`, blocked, missing target, or error),
+- pre/post screen signatures,
+- foreground-package movement,
+- literal UI evidence (including typed text when still visible).
+
+An executor `ok` without any observable effect is `no_progress`, never an
+implicit success. Failed attempts become same-screen admission rules, so an
+identical retry is rejected before policy or device execution. Two failures on
+one plan step, a security block, or a critical loop signal requests a replan.
+There are at most two replans per run, and completed steps remain host-owned
+when unfinished work is replaced.
+
+Plan-step `advance` claims are checked against literal `text:`, `rid:`, or
+`package:` evidence. Overall `done` is also only a proposal: a separate
+zero-tool verifier must account for every host success criterion and cite
+evidence that resolves to the current observation or a verified action id.
+Invalid, missing, or ungrounded verdicts fail closed to continued work.
+
+Every transition is appended to a per-run JSONL event stream under
+`data/agent_runs/`: plan revisions, observations, action proposals, policy
+results, verification outcomes, recovery requests, and the terminal state.
+This log is the audit/replay source; the model never gets to rewrite it.
+
+### 6.3 Loop and stuck detection
 
 The agent has a `ProgressTracker` that runs every step. It hashes two things:
 
@@ -351,27 +390,29 @@ The agent has a `ProgressTracker` that runs every step. It hashes two things:
   last 20 screens kept, plus a global counter of how many *unique* screens
   have been seen.
 
-Five escalating thresholds, in increasing severity:
+Five escalating thresholds identify when recovery is required:
 
 | Condition | Threshold | Response |
 |---|---|---|
 | Same action repeated consecutively | 2 | **warn** — inject hint into prompt |
-| Same action repeated consecutively | 4 | **break** — force a different action |
-| A-B-A-B ping-pong within a 6-step window | — | break |
-| Same screen hash seen N times total | 5 | escalate to `press back` |
-| Steps since a *new* screen hash was first seen | 7 | escalate to `press home` (nuclear) |
+| Same action repeated consecutively | 4 | reject proposal and request replan |
+| A-B-A-B ping-pong within a 6-step window | — | reject proposal and request replan |
+| Same screen hash seen N times total | 5 | request a different route |
+| Steps since a *new* screen hash was first seen | 7 | exhaust the current route and replan |
 
 The screen-hash counter survives non-consecutive repeats: the agent can leave
 a stuck screen, come back to it a few steps later, and the tracker still
-recognises it as the same screen. The "global no progress" counter is the
-strongest signal — if the agent has not seen a single new screen in 7 steps,
-something is wrong globally and home/restart is the only sensible response.
+recognises it as the same screen. These signals no longer override the model
+with a guessed Back or Home press. They enter the controller's recovery state,
+freeze the failed proposal in `do_not_repeat`, and spend a bounded replan. This
+preserves the useful detector without confusing navigation with evidence of
+recovery.
 
 A warn-level signal does not change the action — it injects a stuck hint into
-the LLM prompt so the model can self-correct. Break-level signals override
-the LLM's chosen action entirely.
+the LLM prompt so the model can self-correct. Break-level signals reject the
+proposal and queue replanning; they do not substitute another device action.
 
-### 6.3 State-change detection
+### 6.4 State-change detection
 
 `context_assembler.py` computes a screen signature each step and sets
 `screen_changed = (current_sig != last_sig)`. This boolean is in every prompt
@@ -390,7 +431,7 @@ in the prompt and not just in the tracker:
   `"I tapped Send and the message was sent"` while `screen_changed=false`
   is a clear hallucination, and the audit log captures both fields.
 
-### 6.4 Network transport
+### 6.5 Network transport
 
 The agent calls one of three commercial LLM APIs over HTTPS:
 
@@ -413,7 +454,7 @@ Three notes on the design here:
   prompt going to the LLM. The classifier never asks an external service
   "is this safe?" — that would itself be an injection vector.
 
-### 6.5 Why bge-small for the embedder
+### 6.6 Why bge-small for the embedder
 
 `scripts/embedding_fn.py` defaults to `BAAI/bge-small-en-v1.5`. Three reasons:
 
