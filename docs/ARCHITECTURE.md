@@ -274,9 +274,11 @@ two things:
 Skills live in the same ChromaDB collection as memories, tagged
 `source="skill"`. At task start, the agent's task description is embedded with
 bge-small and used as a similarity query against the skills sub-collection
-(top-3 cosine, gated by `_SKILL_MIN_COSINE = 0.78` — anything below that floor
-is dropped as unrelated noise). The body of the highest-scoring skill is
-attached to the prompt as the `task_procedure` field.
+(top-3 cosine). Candidates must clear `_SKILL_MIN_COSINE = 0.78`; below the
+stronger semantic-only floor, they must also share a meaningful task anchor.
+This second check prevents BGE's compressed score range from admitting a
+high-scoring but unrelated procedure. The body of the highest-scoring survivor
+is attached to the prompt as the `task_procedure` field.
 
 The effect is that the agent no longer reasons from "I am allowed to do
 anything physically possible on this device". It reasons from "this is the
@@ -300,15 +302,13 @@ Two reasons:
    would either be brittle (miss paraphrases) or noisy (fire on every email
    mention).
 
-A skill carries its own threshold via `_SKILL_MIN_COSINE = 0.78`. Cosine
-scores from bge-small on this corpus cluster tightly: a correct match lands
-at 0.80–0.95, while an unrelated query tops out around 0.77. The floor is
-calibrated to that band — drop it and irrelevant skills start firing
-("read my email" matching a "send sms" skill); raise it and legitimate
-paraphrases get filtered. Cosine is logged for the operator but **never
-passed to the agent prompt** — the LLM sees the procedure body alone, with
-no relevance number, so it cannot be tricked into ignoring a skill by being
-told its score is low.
+A skill must clear `_SKILL_MIN_COSINE = 0.78`. Because bge-small scores can
+cluster tightly, a candidate below the stronger semantic-only floor must also
+share a meaningful normalized task anchor. Very strong paraphrases still pass
+without exact token overlap; weaker matches require corroboration. Cosine is
+logged for the operator but **never passed to the agent prompt** — the LLM sees
+the procedure body alone, with no relevance number, so it cannot be tricked
+into ignoring a skill by being told its score is low.
 
 ### Skills are MemShield-protected
 

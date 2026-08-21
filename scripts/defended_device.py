@@ -568,8 +568,26 @@ class DefendedDevice:
                 return "ok"
 
             elif action == "open_app":
-                self._d.app_start(params.get("package", ""))
-                time.sleep(2.5)
+                package = str(params.get("package", "")).strip()
+                if not re.fullmatch(r"[A-Za-z0-9_.]+", package):
+                    return f"invalid package: {package}"
+                try:
+                    launch = subprocess.run(
+                        [
+                            "adb", "-s", self._serial, "shell", "monkey",
+                            "-p", package,
+                            "-c", "android.intent.category.LAUNCHER", "1",
+                        ],
+                        timeout=10,
+                        capture_output=True,
+                        text=True,
+                    )
+                except subprocess.TimeoutExpired:
+                    return "error: app launch timed out"
+                output = f"{launch.stdout}\n{launch.stderr}"
+                if launch.returncode != 0 or "No activities found" in output:
+                    return f"error: app launch failed for {package}"
+                time.sleep(1.5)
                 return "ok"
 
             elif action == "web_tap":

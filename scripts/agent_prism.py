@@ -14,6 +14,12 @@ Usage:
 """
 import argparse, hashlib, json, logging, os, re, sys, time
 from datetime import datetime
+
+# This agent only uses the PyTorch SentenceTransformers path.  Prevent
+# Transformers from importing full TensorFlow/JAX runtimes during startup.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_FLAX", "0")
+
 import requests
 import uiautomator2 as u2
 
@@ -67,23 +73,21 @@ except ImportError:
 # retrieval-defense pipeline (used when PRISM_ENABLE_RETRIEVAL_DEFENSE=1)
 # so ragmask/influence scoring uses the same embedding space as retrieval.
 
-def _make_chroma_embedder() -> "Callable[[str], np.ndarray] | None":
+def _make_chroma_embedder(collection) -> "Callable[[str], np.ndarray] | None":
     """Embedder for MemShield's retrieval-defense scoring.
 
-    Uses the SAME model ChromaDB retrieves with (bge-small via
-    get_embedding_fn) — not a second all-MiniLM model. Two reasons:
+    Uses the SAME model instance ChromaDB retrieves with — not a second
+    SentenceTransformer allocation. Two reasons:
       1. Perf: one embedding model in RAM, not two.
       2. Correctness: ragmask/influence must score in the SAME vector
-         space the docs were retrieved in. The old DefaultEmbeddingFunction
-         scored MiniLM-space distances against a bge-small retrieval set.
+         space the docs were retrieved in.
     """
-    if not _RAG_AVAILABLE:
+    if not _RAG_AVAILABLE or collection is None:
         return None
-    from embedding_fn import get_embedding_fn
-    ef = get_embedding_fn()
 
     def embedder(text: str) -> "np.ndarray":
-        return np.array(ef([text])[0], dtype=np.float32)
+        vectors = collection._embed(input=[text], is_query=True)
+        return np.array(vectors[0], dtype=np.float32)
 
     return embedder
 
@@ -111,7 +115,7 @@ MAX_REPLANS = 2
 GROQ_API   = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-8")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5")
 
 DEEPSEEK_API   = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
@@ -1273,7 +1277,6 @@ def _isolated_json_call(
                 message = client.messages.create(
                     model=CLAUDE_MODEL,
                     max_tokens=max_tokens,
-                    temperature=0.0,
                     system=system_prompt,
                     messages=[{"role": "user", "content": content}],
                 )
@@ -1615,10 +1618,11 @@ def _discover_apps(serial: str) -> list[dict]:
 
     apps = []
     try:
-        # Get launchable app packages + labels via dumpsys
+        # Query every launchable activity. ``resolve-activity`` only returns
+        # one best match and made the agent believe the device had one app.
         result = subprocess.run(
             ["adb", "-s", serial, "shell",
-             "cmd", "package", "resolve-activity", "--brief",
+             "cmd", "package", "query-activities", "--brief",
              "-a", "android.intent.action.MAIN",
              "-c", "android.intent.category.LAUNCHER"],
             capture_output=True, text=True, timeout=10,
@@ -1766,10 +1770,17 @@ def _setup_rag(enable_prism: bool, installed_apps: list[dict] | None = None) -> 
     try:
         db_path = os.path.join(os.path.dirname(__file__), "..", "data", "chromadb")
         client = chromadb.PersistentClient(path=db_path)
-        from embedding_fn import get_embedding_fn
-        collection = client.get_or_create_collection(
-            "agent_kb", embedding_function=get_embedding_fn()
-        )
+        from chromadb.errors import NotFoundError
+        try:
+            # Existing collections persist their embedding-function schema.
+            # Let Chroma restore that one model instead of eagerly creating a
+            # second SentenceTransformer that the schema then ignores.
+            collection = client.get_collection("agent_kb", embedding_function=None)
+        except NotFoundError:
+            from embedding_fn import get_embedding_fn
+            collection = client.create_collection(
+                "agent_kb", embedding_function=get_embedding_fn()
+            )
 
         retrieval_defense = (
             enable_prism
@@ -1789,7 +1800,7 @@ def _setup_rag(enable_prism: bool, installed_apps: list[dict] | None = None) -> 
                 enable_retrieval_defense=retrieval_defense,
                 enable_progrank=progrank,
             ),
-            embedder=_make_chroma_embedder() if retrieval_defense else None,
+            embedder=_make_chroma_embedder(collection) if retrieval_defense else None,
             generator=_concat_generator if retrieval_defense else None,
         )
 
@@ -2193,10 +2204,10 @@ def run(task: str, serial: str = SERIAL, llm: str = "groq",
 
         # ── Correlate the new observation with the previous action ────────
         progress.record_screen(ctx.ui_elements, ctx.screen_changed)
-        try:
-            current_package = d.app_current().get("package")
-        except Exception:
-            current_package = None
+        # The hierarchy already carries the foreground package.  Reusing it
+        # avoids a second unbounded ``dumpsys`` call through adbutils on every
+        # decision (a busy emulator can otherwise stall here for 30+ seconds).
+        current_package = ctx.current_package
         observation = Observation.from_context(ctx, current_package)
         verification, completed_step = controller.observe(observation)
         if verification:

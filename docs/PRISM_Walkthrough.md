@@ -700,9 +700,10 @@ local and explicit; the LLM does not have to be heroic.
 At task start (when `/run` is issued or the queued task fires), the task
 description is embedded with bge-small-en-v1.5 and used as a query against
 the skills sub-collection in ChromaDB (filter: `source="skill"`). Top-3
-nearest neighbours by cosine. Each is gated by the floor
-`_SKILL_MIN_COSINE = 0.78`. The body of the highest-scoring survivor is
-attached to the prompt as `task_procedure`.
+nearest neighbours by cosine. Each must clear `_SKILL_MIN_COSINE = 0.78`;
+matches below the stronger semantic-only floor must also share a meaningful
+task anchor. The body of the highest-scoring survivor is attached to the
+prompt as `task_procedure`.
 
 If no skill clears the floor, the agent runs without a procedure — it still
 has the text-path defenses and Gate A/B, but it does not get an explicit
@@ -711,7 +712,7 @@ action policy.
 \begin{keypoints}
 \begin{itemize}
 \item ChromaDB top-3 with \texttt{source="skill"} filter.
-\item Cosine floor 0.78 keeps unrelated skills from firing.
+\item Cosine plus task-anchor corroboration keeps unrelated skills from firing.
 \item The body, not the trigger, is injected — the trigger is just the index.
 \item Cosine scores are logged for the operator but \emph{never} passed to the agent prompt. The LLM sees the procedure body alone, with no score, so it cannot be tricked into ignoring a skill by being told its score is low.
 \end{itemize}

@@ -67,6 +67,30 @@ _CDP_MAX_CHARS = 2000  # keep web content concise for prompt
 #     a no-skill-applies query (e.g. "remember my name") tops out ~0.77 in
 #     a flat cluster. 0.78 cleanly drops the latter and keeps real matches.
 _SKILL_MIN_COSINE = 0.78
+# A semantic match below this stronger floor must also share a meaningful
+# lexical anchor with the task.  BGE's compressed score range can otherwise
+# rank a completely unrelated procedure highly (for example an email skill
+# for "Open the Clock app").  Very strong paraphrases can still pass without
+# an exact token match.
+_SKILL_SEMANTIC_ONLY_COSINE = 0.88
+_SKILL_ANCHOR_STOPWORDS = frozenset({
+    "a", "an", "and", "app", "application", "do", "for", "from", "in",
+    "into", "is", "it", "me", "my", "of", "on", "open", "please", "the",
+    "to", "use", "with",
+})
+
+
+def _skill_anchor_terms(text: str) -> set[str]:
+    aliases = {
+        "emails": "email", "mail": "email", "mails": "email",
+        "inbox": "email", "messages": "message", "alarms": "alarm",
+        "clocks": "clock", "contacts": "contact", "calendars": "calendar",
+    }
+    return {
+        aliases.get(token, token)
+        for token in re.findall(r"[a-z0-9]+", text.casefold())
+        if len(token) >= 3 and token not in _SKILL_ANCHOR_STOPWORDS
+    }
 # On-device /v1/context assembly (notifications + clipboard + SMS + contacts
 # over accessibility/content providers) routinely exceeds 2s, especially the
 # cold first call. A too-short timeout makes the client disconnect mid-response;
@@ -131,6 +155,7 @@ class AssembledContext:
     task: str
     step: int = 0
     screen_changed: bool = True
+    current_package: str | None = None
     screenshot_b64: str | None = None  # base64 PNG screenshot for multimodal LLMs
     ui_elements: list[dict] = field(default_factory=list)
     notifications: list[dict] = field(default_factory=list)
@@ -178,6 +203,8 @@ class AssembledContext:
         d["task"] = self.task
         d["step"] = self.step
         d["screen_changed"] = self.screen_changed
+        if self.current_package:
+            d["current_package"] = self.current_package
 
         # ── SCREEN (device UI — needed for navigation) ──────────────────
         d["screen"] = self.ui_elements
@@ -379,7 +406,7 @@ class ContextAssembler:
         self._agent_typed_texts = agent_typed_texts or set()
 
         # 1. UI Accessibility (via uiautomator2 — unfiltered, annotate-only)
-        ctx.ui_elements, ui_warned = self._gather_ui()
+        ctx.ui_elements, ui_warned, ctx.current_package = self._gather_ui()
         ctx.warned_counts["ui_accessibility"] = ui_warned
 
         # 1b. Screenshot for multimodal LLMs (Claude) — annotated with idx marks
@@ -782,7 +809,7 @@ class ContextAssembler:
 
     # ── 1. UI Accessibility ──────────────────────────────────────────────────
 
-    def _gather_ui(self) -> tuple[list[dict], int]:
+    def _gather_ui(self) -> tuple[list[dict], int, str | None]:
         """Read screen dump via uiautomator2, annotate injection-suspicious elements.
 
         The agent sees ALL elements unfiltered so it can navigate freely.
@@ -795,11 +822,20 @@ class ContextAssembler:
             root = ET.fromstring(raw_xml)
         except Exception as exc:
             logger.warning(f"UI hierarchy dump failed: {exc}")
-            return [], 0
+            return [], 0, None
+
+        package_counts: dict[str, int] = {}
+        for node in root.iter():
+            package = node.attrib.get("package", "").strip()
+            if package and package != "com.android.systemui":
+                package_counts[package] = package_counts.get(package, 0) + 1
+        current_package = (
+            max(package_counts, key=package_counts.get) if package_counts else None
+        )
 
         elements = self._parse_ui_tree(root)
         if not elements:
-            return [], 0
+            return [], 0, current_package
 
         # Regex injection scan intentionally removed from UI elements.
         # UI text comes from the device's own apps — not untrusted external input.
@@ -822,7 +858,7 @@ class ContextAssembler:
                     "text": web_text,
                 })
 
-        return elements[:25], warned_count
+        return elements[:25], warned_count, current_package
 
     def _read_webview_cdp(self) -> str | None:
         """Read the active Chrome tab's text content via DevTools Protocol.
@@ -1166,6 +1202,7 @@ class ContextAssembler:
             docs  = results.get("documents", [[]])[0]
             metas = results.get("metadatas", [[]])[0]
             dists = results.get("distances", [[]])[0]
+            query_terms = _skill_anchor_terms(query)
             for doc, meta, dist in zip(docs, metas or [], dists or []):
                 # Relevance gate: ChromaDB L2 + normalized embeddings →
                 # cosine = 1 - dist/2. Skills below the floor are unrelated
@@ -1177,6 +1214,14 @@ class ContextAssembler:
                     logger.info(
                         f"[Skill] DROP  cosine={cosine:.3f} < "
                         f"{_SKILL_MIN_COSINE}  — {name}"
+                    )
+                    continue
+                skill_terms = _skill_anchor_terms(f"{name} {doc}")
+                anchors = query_terms & skill_terms
+                if not anchors and cosine < _SKILL_SEMANTIC_ONLY_COSINE:
+                    logger.info(
+                        f"[Skill] DROP  no task anchor and cosine={cosine:.3f} < "
+                        f"{_SKILL_SEMANTIC_ONLY_COSINE}  — {name}"
                     )
                     continue
                 # Cosine is logged for the operator only — it is NEVER added to

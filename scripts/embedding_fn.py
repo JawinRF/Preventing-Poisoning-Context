@@ -26,7 +26,13 @@ import threading
 
 logger = logging.getLogger(__name__)
 
+# SentenceTransformers is used through PyTorch here. Avoid importing two
+# unrelated accelerator stacks just for availability detection.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_FLAX", "0")
+
 EMBED_MODEL = os.getenv("PRISM_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+EMBED_DEVICE = os.getenv("PRISM_EMBED_DEVICE", "cpu")
 
 # Process-wide singleton keys — stored in sys.modules so they survive the
 # double-import problem where this file is loaded as both 'embedding_fn' and
@@ -57,9 +63,11 @@ class _SentenceTransformerEF:
         # Try local cache first — avoids all HF network requests when model is cached.
         # Falls back to network download on first run (model not yet cached).
         try:
-            self._model = SentenceTransformer(model_name, local_files_only=True)
+            self._model = SentenceTransformer(
+                model_name, device=EMBED_DEVICE, local_files_only=True
+            )
         except Exception:
-            self._model = SentenceTransformer(model_name)
+            self._model = SentenceTransformer(model_name, device=EMBED_DEVICE)
         self._model_name = model_name
 
     def __call__(self, input: list[str]) -> list[list[float]]:
